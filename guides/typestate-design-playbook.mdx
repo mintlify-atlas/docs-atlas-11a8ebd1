@@ -1,0 +1,616 @@
+---
+title: "Typestate design playbook"
+description: "Decide when and how to model a workflow with typestate."
+---
+
+If there are particular stages that an abstract entity goes through, and there is meaningful ordering between those stages, you should strongly consider typestate.
+
+That sentence is the center of this guide.
+
+Typestate models states, but its main job here is to encode protocol rules in the API so illegal flows do not type-check. In Rust, that can remove entire bug classes before tests run.
+
+This playbook is opinionated:
+
+- Default to typestate for stable, protocol-heavy workflows.
+- Keep runtime validation for highly dynamic edges.
+- Be explicit about boundaries so complexity stays proportional.
+
+The quality bar for this approach is not only correctness. A good typestate design should also improve readability, modularity, extensibility, expressiveness, idiomaticity, and correctness.
+
+## Canonical running example
+
+This guide uses a document publication flow throughout:
+
+- `Draft`
+- `InReview(ReviewData)`
+- `Published(PublishMeta)`
+
+The exact domain is less important than the structure: finite phases, clear legal transitions, state-specific behavior and data.
+
+## Step 1: Identify the staged entity
+
+Name the thing that changes phase over time. Use a noun, not a verb.
+
+<CardGroup cols={2}>
+  <Card title="Good candidates" icon="circle-check">
+    - `Document`
+    - `Payment`
+    - `Job`
+    - `Deployment`
+  </Card>
+  <Card title="Quick pressure-test" icon="list-check">
+    1. Does this entity have a **finite** set of phases?
+    2. Is transition legality mostly protocol-driven, not user-authored?
+    3. Would an illegal transition be expensive (money, trust, compliance)?
+
+    If you answer "no" to two or more, this may be a runtime-validation domain instead.
+  </Card>
+</CardGroup>
+
+Then write the sequence as plain language first:
+
+- "A document starts in draft."
+- "Draft can be submitted for review."
+- "Only reviewed documents can be published."
+
+<Tip>
+If you cannot describe the lifecycle in plain language, you are not ready to encode it in types. Typestate mirrors conceptual protocol, not accidental implementation details.
+</Tip>
+
+<Warning>
+**Common mistake:** Starting with methods (`publish`, `approve`, `retry`) before defining lifecycle phases. That usually produces leaky APIs where invalid method calls are still possible.
+</Warning>
+
+## Step 2: Enumerate states before methods
+
+Write the finite state set before writing any transition code. For Statum, that means a `#[state]` enum:
+
+```rust
+use statum::state;
+
+#[state]
+pub enum DocumentState {
+    Draft,
+    InReview(ReviewData),
+    Published(PublishMeta),
+}
+
+pub struct ReviewData {
+    pub reviewer: String,
+}
+
+pub struct PublishMeta {
+    pub published_at_unix: i64,
+}
+```
+
+Rules of thumb:
+
+- State names should represent business phases, not transport events.
+- Use data-bearing variants only when data is truly phase-specific.
+- Keep state count minimal but complete.
+
+Keep these concepts separate:
+
+| Concept | Description | Example |
+|---|---|---|
+| **State** | Durable phase | `Draft`, `InReview`, `Published` |
+| **Event** | Signal that can trigger logic | `ApproveClicked`, `TimerExpired` |
+| **Action** | Operation that may cause transition | `submit_for_review`, `publish` |
+
+<Warning>
+**Common mistake:** Creating transitional pseudo-states like `NeedsValidationAndMaybeApproval`. That bundles decision logic and lifecycle phase into one bucket. Split phases and keep branching in methods.
+</Warning>
+
+## Step 3: Define machine context (`#[machine]`)
+
+Put long-lived context on the machine struct: identifiers, dependencies, shared config.
+
+```rust
+use std::sync::Arc;
+use statum::machine;
+
+trait Storage {}
+trait Publisher {}
+
+#[machine]
+pub struct DocumentMachine<DocumentState> {
+    id: String,
+    storage: Arc<dyn Storage>,
+    publisher: Arc<dyn Publisher>,
+}
+```
+
+Use this split:
+
+- **Machine fields:** data needed across many states.
+- **State data:** data that only exists or is valid in one state.
+
+<Note>
+Dependency guidance: put long-lived collaborators (db client, queue handle, repository) on the machine. Prefer trait-object handles or generic wrappers that are cheap to move. Keep large transient payloads in state data, not on the machine root.
+</Note>
+
+<Warning>
+**Common mistake:** Putting all data into machine fields "for convenience." You lose one of typestate's biggest wins: state-constrained data guarantees.
+</Warning>
+
+## Step 3.5: Respect Statum macro boundaries
+
+Keep `#[transition]` impl blocks narrowly focused on legal transition methods. Put non-transition helpers in regular `impl` blocks:
+
+- constructors (`from_command`, `new_with_context`)
+- branch helpers (`build`, `route`, `decide` returning enums)
+- formatting/inspection helpers
+
+```rust
+// Wrong: helper method in a #[transition] impl block.
+#[transition]
+impl PostMessageMachine<Incoming> {
+    fn from_command(cmd: PostMessageCommand) -> Self { /* ... */ }
+}
+
+// Right: helper in regular impl; transitions stay in #[transition] blocks.
+impl PostMessageMachine<Incoming> {
+    fn from_command(cmd: PostMessageCommand) -> Self { /* ... */ }
+}
+
+#[transition]
+impl PostMessageMachine<Incoming> {
+    fn validate_message(self) -> Result<PostMessageMachine<Validated>, Error> { /* ... */ }
+}
+```
+
+<Warning>
+**Common mistake:** Treating `#[transition]` blocks as general-purpose impl blocks. Use them for protocol edges and keep unrelated utilities elsewhere.
+</Warning>
+
+## Step 4: Encode legal transitions (`#[transition]`)
+
+Implement transition methods only on legal source states.
+
+```rust
+use statum::transition;
+
+#[transition]
+impl DocumentMachine<Draft> {
+    fn submit_for_review(self, reviewer: String) -> DocumentMachine<InReview> {
+        self.transition_with(ReviewData { reviewer })
+    }
+}
+
+#[transition]
+impl DocumentMachine<InReview> {
+    fn publish(self, unix_ts: i64) -> DocumentMachine<Published> {
+        self.transition_with(PublishMeta { published_at_unix: unix_ts })
+    }
+}
+```
+
+Choose the transition helper by target state shape:
+
+| Target state | Helper |
+|---|---|
+| Unit state | `transition()` |
+| Data-bearing state | `transition_with(data)` |
+
+Common transition signatures:
+
+```rust
+fn approve(self) -> DocumentMachine<Published>;
+fn try_publish(self) -> Result<DocumentMachine<Published>, statum::Error>;
+fn maybe_publish(self) -> Option<DocumentMachine<Published>>;
+```
+
+Use a direct return when transition is always legal from that source state. Use `Result`/`Option` when runtime checks (permissions, feature flags, side-effect outcomes) gate that edge.
+
+<Warning>
+**Common mistake:** Adding a broad `impl DocumentMachine<S>` with generic transition methods. That reintroduces invalid paths and defeats typestate constraints.
+</Warning>
+
+## Step 4.5: Use a three-layer flow shape
+
+For endpoint/application flows, keep responsibilities explicit:
+
+1. **Boundary adapter:** parse dynamic input into a typed starting machine.
+2. **Protocol transitions:** concrete-state transition methods encode legal edges.
+3. **Orchestration:** sequence transitions and side effects at the call site.
+
+```rust
+let flow = PostMessageMachine::<Incoming>::from_command(cmd);
+let flow = flow.validate_message()?;
+let flow = flow.apply_moderation(&moderator)?;
+let built = flow.build(now);
+```
+
+This pattern makes the happy path easy to read and makes it obvious where runtime uncertainty lives.
+
+## Step 5: Keep branching and guards outside transition definitions
+
+Branch on runtime conditions in normal methods, then dispatch to explicit transition methods.
+
+```rust
+enum ReviewDecision {
+    Approve,
+    Reject,
+}
+
+impl DocumentMachine<InReview> {
+    fn decide(self, decision: ReviewDecision) -> Result<DocumentMachine<Published>, statum::Error> {
+        match decision {
+            ReviewDecision::Approve => Ok(self.publish(now_unix())),
+            ReviewDecision::Reject => Err(statum::Error::InvalidState),
+        }
+    }
+}
+```
+
+For preconditions, add guard methods:
+
+```rust
+impl DocumentMachine<InReview> {
+    fn can_publish(&self) -> bool {
+        !self.state_data.reviewer.is_empty()
+    }
+}
+```
+
+When runtime branching can lead to multiple target states, return a decision enum that carries typed machines for each branch:
+
+```rust
+enum Next {
+    Published(DocumentMachine<Published>),
+    ReturnedToDraft(DocumentMachine<Draft>),
+}
+```
+
+<Warning>
+**Common mistake:** Trying to hide all branching inside one giant transition method that returns different next states ad hoc. Model choices explicitly with enums/results.
+</Warning>
+
+## Step 5.5: Prefer associated methods over wrapper functions
+
+Prefer calling methods directly on typed machine states instead of creating top-level forwarding wrappers. Use top-level functions only when they add boundary adaptation or shared policy.
+
+```rust
+// Preferred
+let flow = flow.validate_message()?;
+let flow = flow.persist(&repo).await?;
+
+// Avoid when it adds no value
+let flow = validate_message(flow)?;
+let flow = persist(flow, &repo).await?;
+```
+
+## Step 6: Be deliberate about state-specific data
+
+Attach data to a state variant only when that data is an invariant of that phase.
+
+- `InReview(ReviewData)` is good if review metadata is only meaningful during review.
+- `Published(PublishMeta)` is good if publication metadata exists only after publishing.
+
+If data is globally relevant (like `id`, tenant, repository handle), keep it on the machine struct.
+
+<Note>
+Ownership cost guideline: if transitions repeatedly clone large payloads, reevaluate placement. Move truly cross-phase data to machine context. Keep state payloads compact and phase-local. Prefer passing lightweight identifiers between states when full payload transfer is unnecessary.
+</Note>
+
+<Warning>
+**Common mistake:** Using state data as a dumping ground for arbitrary payloads. If everything is attached to variants, the model becomes hard to evolve and reason about.
+</Warning>
+
+## Step 7: Rehydrate from persistence with `#[validators]`
+
+When reconstructing from database rows or external records, use validators to map runtime facts back into typed machine states.
+
+```rust
+use statum::validators;
+
+enum DbStatus {
+    Draft,
+    InReview,
+    Published,
+}
+
+struct DbDocument {
+    id: String,
+    status: DbStatus,
+}
+
+#[validators(DocumentMachine)]
+impl DbDocument {
+    fn is_draft(&self) -> statum::Result<()> {
+        match self.status {
+            DbStatus::Draft => Ok(()),
+            _ => Err(statum::Error::InvalidState),
+        }
+    }
+
+    fn is_in_review(&self) -> statum::Result<ReviewData> {
+        match self.status {
+            DbStatus::InReview => Ok(ReviewData { reviewer: "sam".into() }),
+            _ => Err(statum::Error::InvalidState),
+        }
+    }
+
+    fn is_published(&self) -> statum::Result<PublishMeta> {
+        match self.status {
+            DbStatus::Published => Ok(PublishMeta { published_at_unix: 0 }),
+            _ => Err(statum::Error::InvalidState),
+        }
+    }
+}
+```
+
+Then build the machine with context:
+
+```rust
+let typed = row
+    .into_machine()
+    .id("doc-123".to_string())
+    .storage(storage)
+    .publisher(publisher)
+    .build()?;
+```
+
+<Note>
+Validators may be sync or async. If any validator is async, generated machine builders are async too. Keep the validator style consistent within a type so call sites are predictable.
+</Note>
+
+<Warning>
+**Common mistake:** Treating persisted status as trusted and bypassing validation. That invites silent protocol drift and invalid state reconstruction.
+</Warning>
+
+## Step 8: Draw the hybrid boundary explicitly
+
+Keep typestate for stable protocol edges. Keep runtime validation for domains that are inherently dynamic.
+
+<CardGroup cols={2}>
+  <Card title="Type-level core" icon="lock">
+    Edges that must never be violated. Stable protocol phases known at compile time.
+  </Card>
+  <Card title="Runtime policy edge" icon="sliders">
+    Edges controlled by tenant config, experiments, or external plugins.
+  </Card>
+  <Card title="Rehydration boundary" icon="database">
+    All points where dynamic state is converted back into typed machine state.
+  </Card>
+  <Card title="Dynamic / user-authored" icon="pencil">
+    Transition graphs defined at runtime by users or plugins — keep these in a runtime graph engine.
+  </Card>
+</CardGroup>
+
+<Tip>
+Most production systems gain more from a clear hybrid boundary than from forcing type-level modeling into dynamic areas. Typestate adoption is not all-or-nothing.
+</Tip>
+
+## Step 9: Evaluate candidate fit quickly
+
+Before implementing, run this compact checklist:
+
+1. Can you list a finite set of meaningful states?
+2. Are legal transitions mostly known at compile time?
+3. Is invalid transition cost materially high?
+4. Do methods differ by state in a meaningful way?
+5. Does some data become valid/required only in specific states?
+6. Is this lifecycle stable enough to justify type-level encoding?
+
+<CardGroup cols={3}>
+  <Card title="5–6 yes" icon="circle-check">
+    **Strong typestate candidate.** Model full core protocol in typestate first.
+  </Card>
+  <Card title="3–4 yes" icon="circle-half-stroke">
+    **Likely hybrid.** Model "spine" states in typestate, keep optional branches runtime-validated.
+  </Card>
+  <Card title="0–2 yes" icon="circle-xmark">
+    **Runtime model likely better.** Keep explicit validators and state-transition tests; revisit typestate if workflow stabilizes.
+  </Card>
+</CardGroup>
+
+## Step 10: Testing and acceptance criteria
+
+Typestate reduces many invalid-path tests, but it does not remove testing. Test the boundaries where runtime facts enter the system.
+
+**Minimum test set:**
+
+1. Happy-path transition sequence(s) for each main lifecycle.
+2. Guard failure paths for runtime-checked edges (permission checks, missing data, feature gates).
+3. Rehydration coverage for every persisted status variant.
+4. Rollback or retry behavior where applicable.
+5. One migration safety test if replacing an existing runtime model.
+
+**Acceptance criteria for adoption:**
+
+- Illegal transitions are unrepresentable in public API surface.
+- Rehydration from persistence is centralized through validators.
+- Team can explain the lifecycle by reading state names and transition method signatures only.
+- Added type complexity is justified by reduced runtime validation noise.
+
+<Note>
+When runtime transition tests are redundant, remove tests that only assert impossible typed mis-orderings. Keep tests for boundary adapters, guards, side effects, and persistence/rehydration.
+</Note>
+
+## Step 11: Builder + Statum composition
+
+Use builder-style construction for assembling input/context, and `statum` for enforcing protocol legality.
+
+- **Builder:** data assembly and defaults.
+- **Typestate (statum):** ordered lifecycle and legal transitions.
+
+```rust
+let command = PostMessageCommand::builder()
+    .sender(sender)
+    .receiver(receiver)
+    .body(body)
+    .build();
+
+let flow = PostMessageMachine::<Incoming>::from_command(command);
+```
+
+<Warning>
+**Common mistake:** Using builders to simulate protocol steps that should be encoded as typed transitions.
+</Warning>
+
+## End-to-end skeleton
+
+This is a compact shape you can reuse:
+
+```rust
+use std::sync::Arc;
+use statum::{machine, state, transition, validators};
+
+#[state]
+pub enum DocumentState {
+    Draft,
+    InReview(ReviewData),
+    Published(PublishMeta),
+}
+
+pub struct ReviewData {
+    reviewer: String,
+}
+
+pub struct PublishMeta {
+    published_at_unix: i64,
+}
+
+trait Storage {}
+trait Publisher {}
+
+#[machine]
+pub struct DocumentMachine<DocumentState> {
+    id: String,
+    storage: Arc<dyn Storage>,
+    publisher: Arc<dyn Publisher>,
+}
+
+#[transition]
+impl DocumentMachine<Draft> {
+    fn submit_for_review(self, reviewer: String) -> DocumentMachine<InReview> {
+        self.transition_with(ReviewData { reviewer })
+    }
+}
+
+#[transition]
+impl DocumentMachine<InReview> {
+    fn publish(self, unix_ts: i64) -> DocumentMachine<Published> {
+        self.transition_with(PublishMeta { published_at_unix: unix_ts })
+    }
+}
+
+enum DbStatus {
+    Draft,
+    InReview,
+    Published,
+}
+
+struct DbDocument {
+    status: DbStatus,
+}
+
+#[validators(DocumentMachine)]
+impl DbDocument {
+    fn is_draft(&self) -> statum::Result<()> {
+        matches!(self.status, DbStatus::Draft)
+            .then_some(())
+            .ok_or(statum::Error::InvalidState)
+    }
+
+    fn is_in_review(&self) -> statum::Result<ReviewData> {
+        matches!(self.status, DbStatus::InReview)
+            .then_some(ReviewData { reviewer: "sam".into() })
+            .ok_or(statum::Error::InvalidState)
+    }
+
+    fn is_published(&self) -> statum::Result<PublishMeta> {
+        matches!(self.status, DbStatus::Published)
+            .then_some(PublishMeta { published_at_unix: 0 })
+            .ok_or(statum::Error::InvalidState)
+    }
+}
+```
+
+Skeleton expansion for branch routing:
+
+```rust
+enum PublishDecision {
+    Published(DocumentMachine<Published>),
+    StayInReview(DocumentMachine<InReview>),
+}
+
+impl DocumentMachine<InReview> {
+    fn decide_publish(self, can_publish: bool, unix_ts: i64) -> PublishDecision {
+        if can_publish {
+            PublishDecision::Published(self.publish(unix_ts))
+        } else {
+            PublishDecision::StayInReview(self)
+        }
+    }
+}
+```
+
+## Scenario calibration
+
+<CardGroup cols={2}>
+  <Card title="Strong fit: payments" icon="credit-card">
+    `Authorized -> Captured -> Refunded` — high correctness and compliance cost, clear legal edges.
+  </Card>
+  <Card title="Strong fit: content workflow" icon="file-lines">
+    `Draft -> Review -> Publish` — state-specific behavior and data are obvious.
+  </Card>
+  <Card title="Hybrid fit: onboarding" icon="user-plus">
+    Stable high-level phases, dynamic branch logic driven by feature flags and experimentation.
+  </Card>
+  <Card title="Weak fit: user-configurable workflows" icon="diagram-project">
+    Transition graph defined at runtime by users or plugins — keep this in a runtime graph engine.
+  </Card>
+</CardGroup>
+
+## Practical migration path
+
+If you already have a runtime enum/status model:
+
+1. Keep current behavior.
+2. Extract the most expensive invalid transitions.
+3. Encode only that stable core with typestate.
+4. Move state-specific methods into concrete state impl blocks.
+5. Add validators for rehydration boundaries.
+6. Expand only where value continues to exceed complexity.
+
+<Tip>
+This staged migration avoids big-bang rewrites while still delivering compile-time safety early.
+</Tip>
+
+## Anti-patterns and refactors
+
+| Anti-pattern | Refactor |
+|---|---|
+| Giant generic `impl<S>` with transition-like methods | Move methods into concrete `impl Machine<StateX>` blocks |
+| "Everything is state data" | Move cross-cutting fields to machine context |
+| "Everything is machine context" | Encode phase-specific invariants in data-bearing variants |
+| Skipping validators during rehydration | Centralize conversion through `#[validators]` and builder flow |
+| Typestate for volatile user-defined graphs | Maintain runtime graph engine; use typed wrappers only around stable subflows |
+| Forwarding-wrapper explosion (`mark_*`, `run_*`, `next_*`) | Call typed state methods directly; keep free functions only for real boundary adaptation |
+| Non-transition helpers inside `#[transition]` impl blocks | Move constructors/policy helpers into regular impl blocks |
+| Policy branching hidden in procedural glue | Return typed decision enums from concrete states and branch explicitly in orchestration |
+| Clone-heavy transition payload churn | Rebalance machine-context vs state-payload ownership to keep transitions lightweight |
+
+## Design review checklist
+
+1. Are states finite, domain-named, and protocol-meaningful?
+2. Are legal edges represented by methods on concrete source states?
+3. Are `#[transition]` impl blocks free of constructors/helpers?
+4. Are top-level helper functions limited to true boundary/policy concerns?
+5. Are branch decisions represented explicitly (enum/result) instead of hidden glue?
+6. Are ownership/clone costs acceptable across transitions?
+7. Are tests focused on runtime boundaries rather than impossible typed mis-orders?
+
+## Final guidance
+
+The sequence that keeps the model readable, modular, expressive, idiomatic, extensible, and correct:
+
+1. Identify the staged entity.
+2. Define states first.
+3. Encode with `#[state]`.
+4. Define machine context with `#[machine]`.
+5. Implement legal transitions with `#[transition]`.
+6. Add validators when crossing persistence boundaries.

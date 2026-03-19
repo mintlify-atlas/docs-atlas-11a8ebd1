@@ -1,0 +1,168 @@
+---
+title: "CLI deploy pipeline"
+description: "Repeated CLI invocations with SQLite-backed typed rehydration and explicit apply/failure/rollback phases."
+---
+
+This showcase is a file-backed CLI tool built with [Clap](https://docs.rs/clap). Each invocation opens a SQLite database, rehydrates the deployment back into its current typed state, performs one transition, persists the result, and exits. The state is never held in a long-running process — it lives entirely in the database between calls.
+
+## What it demonstrates
+
+- SQLite-backed typed rehydration across independent process invocations
+- A deployment pipeline with seven distinct states and branching outcomes
+- `#[validators]` enforcing that only a structurally valid row can become a typed machine
+- Explicit CLI subcommands that map one-to-one with legal transitions
+
+## State machine
+
+```rust
+#[state]
+pub enum DeploymentState {
+    Draft,
+    Planned(PlanDigest),
+    AwaitingApproval(ApprovalRequest),
+    Applying(OperationId),
+    Applied(ApplyReceipt),
+    RolledBack(RollbackInfo),
+    Failed(FailureInfo),
+}
+```
+
+Each data-bearing state carries only the information produced by that phase. `PlanDigest` is only available after planning. `OperationId` is only available once approval is granted. `ApplyReceipt` is only accessible after a successful apply. The compiler prevents accessing phase-specific data from the wrong state.
+
+## Transitions
+
+```rust
+#[transition]
+impl DeploymentMachine<Draft> {
+    fn plan(self) -> DeploymentMachine<Planned> { ... }
+}
+
+#[transition]
+impl DeploymentMachine<Planned> {
+    fn request_approval(self) -> DeploymentMachine<AwaitingApproval> { ... }
+}
+
+#[transition]
+impl DeploymentMachine<AwaitingApproval> {
+    fn approve(self, approved_by: String) -> DeploymentMachine<Applying> { ... }
+}
+
+#[transition]
+impl DeploymentMachine<Applying> {
+    fn finish_success(self) -> DeploymentMachine<Applied> { ... }
+    fn finish_failure(self, error: String) -> DeploymentMachine<Failed> { ... }
+}
+
+#[transition]
+impl DeploymentMachine<Applied> {
+    fn rollback(self, reason: String) -> DeploymentMachine<RolledBack> { ... }
+}
+```
+
+The `Applying` state has two exit transitions: `finish_success` and `finish_failure`. The CLI `finish-apply` subcommand selects between them with `--result success` or `--result failure`.
+
+## Rehydration from a SQLite row
+
+On each invocation, the CLI fetches the row and rebuilds the typed machine:
+
+```rust
+async fn load_state(&self, id: i64) -> Result<deployment_machine::SomeState, CliError> {
+    let row = self.fetch_row(id).await?;
+    row.clone()
+        .into_machine()
+        .id(row.id)
+        .service(row.service)
+        .environment(row.environment)
+        .version(row.version)
+        .build()
+        .map_err(|_| CliError::CorruptState)
+}
+```
+
+If the row does not satisfy any validator, `.build()` returns `statum::Error::InvalidState` and the CLI reports a corrupt state rather than proceeding with an invalid machine.
+
+## Validators
+
+Each `is_*` method checks that the row's nullable columns are in the configuration expected for that phase. For example, `is_applying` requires both `approved_by` and `operation_id` to be present and non-empty, and requires that all other phase-specific columns are absent:
+
+```rust
+#[validators(DeploymentMachine)]
+impl DeploymentRow {
+    fn is_applying(&self) -> statum::Result<OperationId> {
+        if *id <= 0
+            || service.is_empty()
+            || environment.is_empty()
+            || version.is_empty()
+            || self.status != STATUS_APPLYING
+            || self.plan_digest.is_some()
+            || self.approval_ticket.is_some()
+            || self.receipt_id.is_some()
+            || self.failure_reason.is_some()
+            || self.rollback_reason.is_some()
+        {
+            return Err(statum::Error::InvalidState);
+        }
+
+        match (&self.approved_by, &self.operation_id) {
+            (Some(approved_by), Some(operation_id))
+                if !approved_by.trim().is_empty() && !operation_id.trim().is_empty() =>
+            {
+                Ok(OperationId {
+                    operation_id: operation_id.clone(),
+                    approved_by: approved_by.clone(),
+                })
+            }
+            _ => Err(statum::Error::InvalidState),
+        }
+    }
+    // ... other validators
+}
+```
+
+## CLI subcommands
+
+| Subcommand | Required state | Transition |
+|---|---|---|
+| `create` | — | Creates a draft deployment |
+| `show` | Any | Prints current state |
+| `plan` | `Draft` | → `Planned` |
+| `request-approval` | `Planned` | → `AwaitingApproval` |
+| `approve --by <name>` | `AwaitingApproval` | → `Applying` |
+| `finish-apply --result success` | `Applying` | → `Applied` |
+| `finish-apply --result failure --reason <msg>` | `Applying` | → `Failed` |
+| `rollback --reason <msg>` | `Applied` | → `RolledBack` |
+
+## How to run
+
+```bash
+cargo run -p statum-examples --bin clap-sqlite-deploy-pipeline
+```
+
+Run subcommands to walk a deployment through its lifecycle:
+
+```bash
+# Create a deployment
+cargo run -p statum-examples --bin clap-sqlite-deploy-pipeline -- \
+  create --service api --env prod --version 1.2.3
+
+# Plan it (use the id returned from create)
+cargo run -p statum-examples --bin clap-sqlite-deploy-pipeline -- plan 1
+
+# Request approval
+cargo run -p statum-examples --bin clap-sqlite-deploy-pipeline -- request-approval 1
+
+# Approve
+cargo run -p statum-examples --bin clap-sqlite-deploy-pipeline -- approve 1 --by alice
+
+# Finish successfully
+cargo run -p statum-examples --bin clap-sqlite-deploy-pipeline -- \
+  finish-apply 1 --result success
+
+# Or simulate a failure and rollback
+cargo run -p statum-examples --bin clap-sqlite-deploy-pipeline -- \
+  finish-apply 1 --result failure --reason "health check timed out"
+```
+
+<Note>
+  The database is stored at `target/statum-examples/deploy-pipeline.db` by default. Use `--db <path>` to specify a different location.
+</Note>

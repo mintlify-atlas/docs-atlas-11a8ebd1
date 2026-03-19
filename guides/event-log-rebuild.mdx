@@ -1,0 +1,195 @@
+---
+title: "Event log rebuild"
+description: "Project append-only events into typed machine states."
+---
+
+This is the strongest Statum example in the repo because it shows the part that is hard to fake with normal status enums: rebuilding a workflow from append-only events without dropping back to ad hoc runtime branching.
+
+It is also the clearest representational-correctness story in the repo: raw projected facts do not become ordinary workflow values until they can be proven to match one legal state.
+
+## The problem shape
+
+You have an append-only event log:
+
+- `created`
+- `paid`
+- `packed`
+- `shipped`
+- `delivered`
+
+You need to answer questions like:
+
+- What state is this order in now?
+- Which operations are legal next?
+- Which fields are only valid after specific events?
+
+The usual runtime shape is: reduce events into a row or snapshot, carry a status string or enum, branch on that status later, and hope the data attached to that status is still consistent. That works, but the legal workflow still lives in runtime code. Undesirable or inconsistent states can still travel as ordinary values.
+
+## The Statum shape
+
+Statum splits the problem into three explicit layers:
+
+<Steps>
+
+### Declare the legal phases with `#[state]`
+
+Name every valid phase of the order lifecycle:
+
+```rust
+use statum::state;
+
+#[state]
+enum OrderState {
+    Created,
+    Paid,
+    Packed,
+    Shipped,
+    Delivered,
+}
+```
+
+Only legal edges exist. For example:
+
+- `Created -> Paid`
+- `Paid -> Packed`
+- `Packed -> Shipped`
+- `Shipped -> Delivered`
+
+After reconstruction, you work with the concrete typed machine. If you are in `Packed`, the next legal operation is `ship(...)`. There is no normal method for skipping ahead to `deliver()` from the wrong state.
+
+### Reduce the event stream into a projection row
+
+Use `statum::projection` to fold the append-only stream into one snapshot per order.
+
+The `ProjectionReducer` trait gives you a typed fold:
+
+```rust
+use statum::projection::ProjectionReducer;
+
+pub trait ProjectionReducer<Event> {
+    /// The output projection type.
+    type Projection;
+    /// The reducer-specific error type.
+    type Error;
+
+    /// Create the first projection value from the first event in a stream.
+    fn seed(&self, event: &Event) -> Result<Self::Projection, Self::Error>;
+
+    /// Apply a later event to an existing projection value.
+    fn apply(&self, projection: &mut Self::Projection, event: &Event) -> Result<(), Self::Error>;
+}
+```
+
+For a single stream, use `reduce_one`:
+
+```rust
+let row = projection::reduce_one(events, &OrderProjector)?;
+```
+
+For interleaved streams keyed by order ID, use `reduce_grouped`. It preserves first-seen key order:
+
+```rust
+use statum::projection::reduce_grouped;
+
+let projections = reduce_grouped(
+    events,
+    |event| event.order_id,
+    &OrderProjector,
+)?;
+```
+
+The projection row may carry optional fields like `payment_receipt`, `pick_ticket`, and `tracking_number`, but the rebuilt machines do not expose them uniformly. Instead:
+
+- `Paid` carries `payment_receipt`
+- `Packed` carries `payment_receipt` and `pick_ticket`
+- `Shipped` carries `tracking_number` too
+
+That makes the type system reflect the event history you actually observed. Fields stop existing in phases where they would only be guesses.
+
+### Rehydrate projections into typed machines with `#[validators]`
+
+Once you have a projection row, attach `#[validators(OrderMachine)]` to rebuild typed machines:
+
+```rust
+use statum::{machine, validators};
+
+#[machine]
+struct OrderMachine<OrderState> {
+    order_id: u64,
+}
+
+#[validators(OrderMachine)]
+impl OrderProjection {
+    fn is_created(&self) -> statum::Result<()> { /* ... */ }
+    fn is_paid(&self) -> statum::Result<PaymentData> { /* ... */ }
+    fn is_packed(&self) -> statum::Result<PackData> { /* ... */ }
+    fn is_shipped(&self) -> statum::Result<ShipData> { /* ... */ }
+    fn is_delivered(&self) -> statum::Result<()> { /* ... */ }
+}
+```
+
+For a single order:
+
+```rust
+let row = projection::reduce_one(events, &OrderProjector)?;
+let state = row.into_machine().build()?;
+```
+
+For many orders in one pass:
+
+```rust
+let projections = reduce_grouped(events, |event| event.order_id, &OrderProjector)?;
+let machines = projections.into_machines().build();
+```
+
+After that, downstream code works on typed states rather than repeating snapshot-to-workflow interpretation logic. That is the handoff from unvalidated facts to legal domain states.
+
+</Steps>
+
+## What gets better
+
+**Illegal transitions stop being ordinary method calls.** The example only defines legal edges. After reconstruction, you work with a concrete typed machine, and illegal transitions do not compile.
+
+**State-specific data stops leaking across phases.** The type system reflects the event history you actually observed. Fields stop existing in phases where they would only be guesses.
+
+**Rehydration becomes one explicit boundary.** Without Statum, it is common to reduce events into a snapshot and then keep rechecking status everywhere. With Statum, projection is one step and typed rebuild is the next step.
+
+**Batch rebuilds stay typed too.** `.into_machines()` after grouped projection lets many orders be reconstructed in one pass — useful because append-only systems rarely rebuild just one workflow at a time.
+
+## Projection API reference
+
+`statum::projection` ships three building blocks:
+
+| Item | Description |
+|---|---|
+| `ProjectionReducer<Event>` | Trait for defining a typed fold. Implement `seed` for the first event and `apply` for subsequent events. |
+| `reduce_one(events, reducer)` | Reduces one ordered event stream into one projection value. Returns `ProjectionError::EmptyInput` if the stream is empty. |
+| `reduce_grouped(events, key_fn, reducer)` | Reduces many interleaved streams into one projection per key, preserving first-seen key order. |
+
+`ProjectionError<E>` has two variants:
+
+- `EmptyInput` — the reducer was asked to fold an empty stream.
+- `Reducer(E)` — the reducer rejected one of the events.
+
+## Why this is a good Statum fit
+
+This example fits Statum well because the workflow has:
+
+- a stable set of legal phases
+- expensive invalid transitions
+- state-specific data that should not exist everywhere
+- a persistence boundary where runtime facts must be turned back into a legal workflow shape
+
+That is the kind of problem where typestate removes a real class of mistakes.
+
+## What this example does not claim
+
+Statum is not replacing event storage, projections, or orchestration. There is still an explicit projector and explicit persistence code.
+
+What Statum owns is the workflow boundary after projection:
+
+- Are these facts a legal `Created` order?
+- Or `Paid`? Or `Packed`?
+- And once rebuilt, which transitions are legal next?
+
+That is the part that would otherwise decay into scattered runtime checks.

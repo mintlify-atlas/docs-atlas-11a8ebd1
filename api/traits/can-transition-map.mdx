@@ -1,0 +1,93 @@
+---
+title: "CanTransitionMap"
+description: "Stable trait-level view of self.transition_map(|current| ...)."
+---
+
+`CanTransitionMap<Next>` is the stable, generic bound for machines that can move to a data-bearing state by consuming their current state data and producing the next payload from it. It is the trait-level equivalent of calling `self.transition_map(|current| ...)` inside a `#[transition]` impl.
+
+## Trait definition
+
+```rust
+pub trait CanTransitionMap<Next: StateMarker> {
+    /// The payload type stored in the current state.
+    type CurrentData;
+    /// The transition result type.
+    type Output;
+
+    /// Perform the transition by consuming the current state data and producing the next payload.
+    fn transition_map<F>(self, f: F) -> Self::Output
+    where
+        F: FnOnce(Self::CurrentData) -> Next::Data;
+}
+```
+
+## When it is implemented
+
+`#[transition]` impl blocks that contain a `self.transition_map(...)` call generate an implementation of `CanTransitionMap<Next>` on `Machine<CurrentState>`.
+
+## Usage
+
+Use `CanTransitionMap` as a bound in generic code that must accept any machine capable of mapping its current state data into a new state:
+
+```rust
+use statum::{CanTransitionMap, StateMarker};
+
+fn remap<M, Next>(machine: M, f: impl FnOnce(M::CurrentData) -> Next::Data) -> M::Output
+where
+    Next: StateMarker,
+    M: CanTransitionMap<Next>,
+{
+    machine.transition_map(f)
+}
+```
+
+## Example
+
+```rust
+use statum::{machine, state, transition};
+
+#[state]
+enum CheckoutState {
+    EmptyCart,
+    ReadyToPay(OrderDraft),
+    Paid,
+}
+
+#[derive(Clone)]
+struct OrderDraft {
+    total_cents: u64,
+}
+
+#[machine]
+struct Checkout<CheckoutState> {
+    id: String,
+}
+
+#[transition]
+impl Checkout<ReadyToPay> {
+    fn pay(self) -> Checkout<Paid> {
+        self.transition()
+    }
+}
+```
+
+When the current and next states both carry data, `transition_map` lets you derive the next payload from the current one without extracting it manually:
+
+```rust
+#[transition]
+impl Order<Pending> {
+    fn apply_discount(self) -> Order<Discounted> {
+        self.transition_map(|pending_data| DiscountedData {
+            original_cents: pending_data.total_cents,
+            discounted_cents: pending_data.total_cents / 2,
+        })
+    }
+}
+```
+
+## Related
+
+- [`#[transition]`](/api/transition) — the macro that generates `CanTransitionMap` implementations.
+- [`CanTransitionTo`](/api/traits/can-transition-to) — for transitions to unit target states.
+- [`CanTransitionWith`](/api/traits/can-transition-with) — for transitions that supply new data to the next state.
+- [`StateMarker`](/api/traits/state-marker) — base trait for all state marker types.

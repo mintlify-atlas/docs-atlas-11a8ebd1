@@ -1,0 +1,84 @@
+---
+title: "StateMarker"
+description: "Trait implemented by all generated state marker types."
+---
+
+`StateMarker` is implemented on every marker type that `#[state]` generates. It is the common bound Statum uses when a type must be a valid state.
+
+## Trait definition
+
+```rust
+pub trait StateMarker {
+    /// The payload type stored in machines for this state.
+    type Data;
+}
+```
+
+The associated `Data` type is:
+
+- `()` for unit states (no associated payload).
+- The tuple payload type for data-bearing states.
+
+## Sub-traits
+
+### `UnitState`
+
+```rust
+pub trait UnitState: StateMarker<Data = ()> {}
+```
+
+`UnitState` is implemented for markers generated from unit variants — variants declared with no associated data (e.g., `Draft`, `Published`, `Off`). It constrains `Data` to `()`.
+
+### `DataState`
+
+```rust
+pub trait DataState: StateMarker {}
+```
+
+`DataState` is implemented for markers generated from single-field tuple variants — variants that carry a payload (e.g., `InReview(Assignment)`, `ReadyToPay(OrderDraft)`).
+
+## Which types implement each trait
+
+Given this state enum:
+
+```rust
+#[state]
+enum TaskState {
+    Draft,
+    InReview(String),
+    Published,
+}
+```
+
+The generated implementations are:
+
+| Marker type | `StateMarker::Data` | `UnitState` | `DataState` |
+|---|---|---|---|
+| `Draft` | `()` | yes | no |
+| `InReview` | `String` | no | yes |
+| `Published` | `()` | yes | no |
+
+## Usage as a bound
+
+Use `StateMarker` as a bound when writing generic code that must work with any state:
+
+```rust
+fn state_data_size<S: StateMarker>() -> usize {
+    std::mem::size_of::<S::Data>()
+}
+```
+
+Use `UnitState` or `DataState` when you want to restrict to one category:
+
+```rust
+fn requires_no_data<S: UnitState>(machine: &Machine<S>) {
+    // S::Data is guaranteed to be ()
+}
+```
+
+## Related
+
+- [`#[state]`](/api/state) — the macro that generates marker types and their trait implementations.
+- [`CanTransitionTo`](/api/traits/can-transition-to) — transition trait for unit target states.
+- [`CanTransitionWith`](/api/traits/can-transition-with) — transition trait for data-bearing target states.
+- [`CanTransitionMap`](/api/traits/can-transition-map) — transition trait that maps current data to next data.

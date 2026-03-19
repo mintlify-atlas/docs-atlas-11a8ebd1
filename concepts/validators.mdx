@@ -1,0 +1,238 @@
+---
+title: "#[validators]"
+description: "Rebuild typed machines from persisted data."
+---
+
+`#[validators(Machine)]` is attached to an `impl` block on a persisted type — a database row, a document, or any other stored representation. It generates the glue that turns raw persisted facts into typed machines.
+
+## What it does
+
+Validators define the boundary between stored data and typed workflow state. Each `is_{state}` method checks whether the persisted value belongs to one state, returns the appropriate payload or unit, and Statum generates the builder that tries all validators and produces a typed result.
+
+The generated API:
+
+<Steps>
+  <Step title="Write one is_{state} method per variant">
+    Return `statum::Result<()>` for unit states and `statum::Result<StateData>` for data-bearing states.
+  </Step>
+  <Step title="Call into_machine() or into_machines()">
+    `into_machine()` rebuilds one item. `into_machines()` rebuilds a collection when all items share the same machine fields. `into_machines_by(...)` rebuilds a collection when each item needs different fields.
+  </Step>
+  <Step title="Match on machine::SomeState">
+    The builder returns the generated wrapper enum. Match once to recover the concrete typed machine for each state.
+  </Step>
+</Steps>
+
+## Naming convention
+
+The method name must follow the pattern `is_{state_variant_snake_case}`:
+
+| State variant | Method name |
+|---|---|
+| `Draft` | `is_draft` |
+| `InReview` | `is_in_review` |
+| `Published` | `is_published` |
+
+## Return types
+
+| Variant kind | Return type |
+|---|---|
+| Unit state (`Draft`) | `statum::Result<()>` |
+| Data-bearing state (`InReview(T)`) | `statum::Result<T>` |
+
+Return `Ok(...)` when the persisted value matches this state. Return `Err(statum::Error::InvalidState)` when it does not. If no validator matches, reconstruction fails with `InvalidState`.
+
+## Machine field bindings
+
+Machine fields are available by name inside validator bodies through generated bindings. Persisted-row fields live on `self` as usual.
+
+If the machine is declared as:
+
+```rust
+#[machine]
+struct TaskMachine<TaskState> {
+    client: String,
+    name: String,
+}
+```
+
+then `client` and `name` are usable directly inside every `is_*` method — no manual parameter threading required. This allows validators to fetch additional data or apply machine-scoped context.
+
+## Full example
+
+The `TaskMachine` example shows all three states — unit, data-bearing, and unit again — with a real rebuild call and match:
+
+```rust
+use statum::{machine, state, validators, Error};
+
+#[state]
+enum TaskState {
+    Draft,
+    InReview(String),
+    Published,
+}
+
+#[machine]
+struct Task<TaskState> {
+    id: u64,
+}
+
+struct TaskRow {
+    id: u64,
+    status: &'static str,
+    reviewer: Option<String>,
+}
+
+#[validators(Task)]
+impl TaskRow {
+    fn is_draft(&self) -> statum::Result<()> {
+        if self.status == "draft" {
+            Ok(())
+        } else {
+            Err(Error::InvalidState)
+        }
+    }
+
+    fn is_in_review(&self) -> statum::Result<String> {
+        if self.status == "in_review" {
+            self.reviewer.clone().ok_or(Error::InvalidState)
+        } else {
+            Err(Error::InvalidState)
+        }
+    }
+
+    fn is_published(&self) -> statum::Result<()> {
+        if self.status == "published" {
+            Ok(())
+        } else {
+            Err(Error::InvalidState)
+        }
+    }
+}
+
+fn main() -> statum::Result<()> {
+    let row = TaskRow {
+        id: 7,
+        status: "in_review",
+        reviewer: Some("alice".to_owned()),
+    };
+
+    let row_id = row.id;
+    let machine = row.into_machine().id(row_id).build()?;
+
+    match machine {
+        task::SomeState::InReview(task) => assert_eq!(task.state_data, "alice"),
+        _ => panic!("expected in-review task"),
+    }
+
+    Ok(())
+}
+```
+
+## Single-item reconstruction
+
+`into_machine()` works for one persisted value. Chain machine field setters before `.build()`:
+
+```rust
+let row_id = row.id;
+let machine = row.into_machine().id(row_id).build()?;
+```
+
+`.build()` returns `statum::Result<machine::SomeState>`.
+
+## Batch reconstruction
+
+<AccordionGroup>
+  <Accordion title="Shared context: into_machines()">
+    When every item in a collection shares the same machine fields, call `.into_machines()` directly.
+    In the same module as the `#[validators]` impl, no import is needed:
+
+    ```rust
+    let machines = rows
+        .into_machines()
+        .client("acme".to_owned())
+        .build()
+        .await;
+    ```
+
+    From other modules, import the machine-scoped batch trait first:
+
+    ```rust
+    use task_machine::IntoMachinesExt as _;
+
+    let machines = rows
+        .into_machines()
+        .client("acme".to_owned())
+        .build()
+        .await;
+    ```
+  </Accordion>
+  <Accordion title="Per-item context: into_machines_by(...)">
+    When each row carries its own machine context, use `.into_machines_by(...)` and return the generated `machine::Fields` struct:
+
+    ```rust
+    use task_machine::IntoMachinesExt as _;
+
+    let machines = rows
+        .into_machines_by(|row| task_machine::Fields {
+            client: row.client.clone(),
+            name: row.name.clone(),
+        })
+        .build()
+        .await;
+    ```
+
+    This returns one result per item, so you can fail fast, collect only valid machines, or report partial errors.
+  </Accordion>
+</AccordionGroup>
+
+## Async validators
+
+If any validator method is `async`, the generated builder becomes `async` too. Add `.await` after `.build()`:
+
+```rust
+#[validators(Machine)]
+impl Article {
+    pub async fn is_draft(&self) -> statum::Result<Article> {
+        // machine field `client` is available directly
+        let is_valid = pretend_validation_call(client).await?;
+        if is_valid && self.status == Status::Draft {
+            Ok(Article { status: Status::Draft })
+        } else {
+            Err(statum::Error::InvalidState)
+        }
+    }
+
+    pub fn is_in_review(&self) -> statum::Result<()> {
+        if self.status == Status::InReview {
+            Ok(())
+        } else {
+            Err(statum::Error::InvalidState)
+        }
+    }
+}
+
+// Build becomes async when any validator is async
+let machine = article
+    .into_machine()
+    .client(my_client)
+    .build()
+    .await
+    .unwrap();
+```
+
+## The machine::SomeState enum
+
+After `.build()`, you hold a `machine::SomeState` wrapper. Match it to get the concrete typed machine for each state:
+
+```rust
+match machine_state {
+    machine::SomeState::Draft(_machine) => println!("Machine<Draft>"),
+    machine::SomeState::InReview(_machine) => println!("Machine<InReview>"),
+    machine::SomeState::Published(_machine) => println!("Machine<Published>"),
+}
+```
+
+<Note>
+  `machine::State` is kept as an alias for `machine::SomeState` so that older code continues to compile without changes.
+</Note>

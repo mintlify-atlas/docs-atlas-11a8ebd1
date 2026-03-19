@@ -1,0 +1,230 @@
+---
+title: "#[transition]"
+description: "Declare the legal edges between states."
+---
+
+`#[transition]` is applied to an `impl Machine<CurrentState>` block. It validates that the methods inside consume `self` and return a `Machine<NextState>`, and it makes three transition helpers available inside the block.
+
+## What it does
+
+Apply `#[transition]` to one `impl` block per source state. The macro checks that each method signature is a valid protocol edge: methods must take `self` or `mut self` and return `Machine<NextState>`, optionally wrapped in `Result` or `Option`.
+
+Inside an annotated impl block, three helpers become available:
+
+<CardGroup cols={3}>
+  <Card title="self.transition()" icon="arrow-right">
+    Move to a unit target state. No payload required.
+  </Card>
+  <Card title="self.transition_with(data)" icon="package">
+    Move to a data-bearing target state by providing the payload.
+  </Card>
+  <Card title="self.transition_map(|current| next)" icon="shuffle">
+    Build the next payload from the current payload using a closure.
+  </Card>
+</CardGroup>
+
+## Rules
+
+- Apply to `impl Machine<State>` blocks that define legal transitions.
+- Transition methods must take `self` or `mut self`.
+- Return `Machine<NextState>` directly, or wrap it in `Result` or `Option` for conditional transitions.
+- Use `transition_with(data)` when the target state carries a payload.
+
+<Tip>
+  Keep non-transition helpers in normal `impl` blocks without `#[transition]`. The attribute is for protocol edges, not general utility methods.
+</Tip>
+
+## self.transition()
+
+Use for moving to a unit target state:
+
+```rust
+use statum::{machine, state, transition};
+
+#[state]
+enum State {
+    Draft,
+    InReview,
+    Published,
+}
+
+#[machine]
+struct Machine<State> {}
+
+#[transition]
+impl Machine<Draft> {
+    fn into_in_review(self) -> Machine<InReview> {
+        self.transition()
+    }
+}
+
+#[transition]
+impl Machine<InReview> {
+    fn into_published(self) -> Machine<Published> {
+        self.transition()
+    }
+}
+
+fn main() {
+    let machine = Machine::<Draft>::builder().build();
+    let machine = machine.into_in_review();
+    let _machine = machine.into_published();
+}
+```
+
+## self.transition_with(data)
+
+Use when the next state carries a payload. Pass the data directly:
+
+```rust
+use statum::{machine, state, transition};
+
+#[state]
+enum State {
+    Draft(MyDraft),
+    InReview(DraftWithComment),
+    Published,
+}
+
+#[machine]
+struct Machine<State> {}
+
+struct MyDraft {
+    title: String,
+    content: String,
+}
+
+struct DraftWithComment {
+    draft: MyDraft,
+    comment: String,
+}
+
+#[transition]
+impl Machine<Draft> {
+    pub fn into_review(self) -> Machine<InReview> {
+        let my_draft = &self.state_data;
+        let draft_with_comment = DraftWithComment {
+            draft: MyDraft {
+                title: my_draft.title.clone(),
+                content: my_draft.content.clone(),
+            },
+            comment: "This is a comment".to_owned(),
+        };
+        self.transition_with(draft_with_comment)
+    }
+}
+
+#[transition]
+impl Machine<InReview> {
+    pub fn into_published(self) -> Machine<Published> {
+        self.transition()
+    }
+}
+```
+
+## self.transition_map(|current| next)
+
+Use when the next payload is derived from the current payload. The closure receives the current `state_data` by value:
+
+```rust
+use statum::{machine, state, transition};
+
+#[state]
+enum State {
+    Draft(DraftDocument),
+    InReview(ReviewDocument),
+    Published,
+}
+
+#[machine]
+struct Machine<State> {
+    client: String,
+}
+
+struct DraftDocument {
+    title: String,
+    body: String,
+}
+
+struct ReviewDocument {
+    title: String,
+    body: String,
+    reviewer: String,
+}
+
+#[transition]
+impl Machine<Draft> {
+    pub fn into_review(self, reviewer: String) -> Machine<InReview> {
+        self.transition_map(|draft| ReviewDocument {
+            title: draft.title,
+            body: draft.body,
+            reviewer,
+        })
+    }
+}
+
+#[transition]
+impl Machine<InReview> {
+    pub fn publish(self) -> Machine<Published> {
+        self.transition()
+    }
+}
+
+fn main() {
+    let machine = Machine::<Draft>::builder()
+        .client("docs".to_owned())
+        .state_data(DraftDocument {
+            title: "Spec".to_owned(),
+            body: "Ship transition_map".to_owned(),
+        })
+        .build();
+
+    let review = machine.into_review("Ada".to_owned());
+    assert_eq!(review.state_data.reviewer.as_str(), "Ada");
+
+    let _published = review.publish();
+}
+```
+
+## Guarded transitions
+
+Return `Result<Machine<Next>>` or `Ok/Err` with different machine types when a transition is conditional:
+
+```rust
+use statum::{machine, state, transition};
+
+#[state]
+pub enum State {
+    Pending,
+    Confirmed,
+    Reverted,
+}
+
+#[machine]
+pub struct Machine<State> {}
+
+#[transition]
+impl Machine<Pending> {
+    pub fn confirm(self) -> Result<Machine<Confirmed>, Machine<Reverted>> {
+        if true {
+            Ok(self.transition())
+        } else {
+            Err(self.rollback())
+        }
+    }
+
+    pub fn rollback(self) -> Machine<Reverted> {
+        self.transition()
+    }
+}
+
+fn main() {
+    let machine = Machine::<Pending>::builder().build();
+    match machine.confirm() {
+        Ok(_confirmed) => println!("confirmed"),
+        Err(_reverted) => println!("reverted"),
+    }
+}
+```
+
+The compiler ensures that the `Ok` branch carries `Machine<Confirmed>` and the `Err` branch carries `Machine<Reverted>`. Neither can be confused with the other.

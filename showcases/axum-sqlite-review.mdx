@@ -1,0 +1,191 @@
+---
+title: "Axum + SQLite review"
+description: "HTTP review workflow with typed state rehydration from SQLite on each request."
+---
+
+This showcase runs a small Axum HTTP server that manages documents through a three-phase review workflow: `Draft` → `InReview` → `Published`. The state machine is not held in memory between requests. Each handler fetches the row from SQLite and rebuilds a typed machine before doing anything with it.
+
+## What it demonstrates
+
+- `#[validators]` rebuilding typed machines from database rows on every HTTP request
+- Transition guards expressed as compile-time types rather than runtime status checks
+- State-specific data (`ReviewAssignment`) that only exists on the `InReview` variant
+- HTTP 409 responses when a transition is attempted from the wrong phase
+
+## State machine
+
+```rust
+#[state]
+enum DocumentState {
+    Draft,
+    InReview(ReviewAssignment),
+    Published,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReviewAssignment {
+    reviewer: String,
+}
+
+#[machine]
+struct DocumentMachine<DocumentState> {
+    id: i64,
+    title: String,
+    body: String,
+}
+```
+
+`ReviewAssignment` is only accessible when the machine is `InReview`. A `Draft` or `Published` machine carries no reviewer field at all.
+
+## Transitions
+
+```rust
+#[transition]
+impl DocumentMachine<Draft> {
+    fn submit(self, reviewer: String) -> DocumentMachine<InReview> {
+        self.transition_with(ReviewAssignment { reviewer })
+    }
+}
+
+#[transition]
+impl DocumentMachine<InReview> {
+    fn approve(self) -> DocumentMachine<Published> {
+        self.transition()
+    }
+}
+```
+
+`submit` is only callable on a `Draft` machine. `approve` is only callable on an `InReview` machine. These are compile-time constraints, not runtime guards.
+
+## Validators: rebuilding typed machines from database rows
+
+The database stores documents as flat rows with a `status` string. `#[validators]` maps those rows back to the correct typed machine:
+
+```rust
+#[validators(DocumentMachine)]
+impl DocumentRow {
+    fn is_draft(&self) -> statum::Result<()> {
+        if *id > 0
+            && !title.is_empty()
+            && !body.is_empty()
+            && self.status == STATUS_DRAFT
+            && self.reviewer.is_none()
+        {
+            Ok(())
+        } else {
+            Err(statum::Error::InvalidState)
+        }
+    }
+
+    fn is_in_review(&self) -> statum::Result<ReviewAssignment> {
+        if *id <= 0 || title.is_empty() || body.is_empty() || self.status != STATUS_IN_REVIEW {
+            return Err(statum::Error::InvalidState);
+        }
+
+        self.reviewer
+            .clone()
+            .filter(|reviewer| !reviewer.trim().is_empty())
+            .map(|reviewer| ReviewAssignment { reviewer })
+            .ok_or(statum::Error::InvalidState)
+    }
+
+    fn is_published(&self) -> statum::Result<()> {
+        if *id > 0
+            && !title.is_empty()
+            && !body.is_empty()
+            && self.status == STATUS_PUBLISHED
+            && self.reviewer.is_none()
+        {
+            Ok(())
+        } else {
+            Err(statum::Error::InvalidState)
+        }
+    }
+}
+```
+
+Inside each `is_*` method, machine fields (`id`, `title`, `body`) are available by name via generated bindings. Row fields still live on `self`.
+
+## Rehydration in the handler
+
+Every mutating handler calls `load_document_state` before doing anything:
+
+```rust
+async fn load_document_state(
+    pool: &SqlitePool,
+    id: i64,
+) -> Result<document_machine::SomeState, AppError> {
+    let row = fetch_document_row(pool, id).await?;
+
+    row.clone()
+        .into_machine()
+        .id(row.id)
+        .title(row.title)
+        .body(row.body)
+        .build()
+        .map_err(|_| AppError::CorruptState)
+}
+```
+
+The returned `document_machine::SomeState` is then matched to enforce the correct phase:
+
+```rust
+async fn submit_document(
+    State(app): State<AppState>,
+    Path(id): Path<i64>,
+    Json(request): Json<SubmitDocumentRequest>,
+) -> Result<Json<DocumentResponse>, AppError> {
+    let machine = load_document_state(&app.pool, id).await?;
+
+    let machine = match machine {
+        document_machine::SomeState::Draft(machine) => machine.submit(request.reviewer),
+        _ => {
+            return Err(AppError::invalid_transition(
+                "submit requires a draft document",
+            ));
+        }
+    };
+
+    persist_in_review(&app.pool, &machine).await?;
+    let row = fetch_document_row(&app.pool, id).await?;
+    Ok(Json(row.into_response()))
+}
+```
+
+The `_ =>` arm returns HTTP 409. There is no other guard. The type system has already expressed which transitions are legal.
+
+## HTTP routes
+
+| Method | Path | Required state | Transition |
+|---|---|---|---|
+| `POST` | `/documents` | — | Creates a draft |
+| `GET` | `/documents/{id}` | Any | Read-only |
+| `POST` | `/documents/{id}/submit` | `Draft` | → `InReview` |
+| `POST` | `/documents/{id}/approve` | `InReview` | → `Published` |
+
+## How to run
+
+```bash
+cargo run -p statum-examples --bin axum-sqlite-review
+```
+
+The server starts on `127.0.0.1:3000`. You can drive it with curl:
+
+```bash
+# Create a draft
+curl -s -X POST http://localhost:3000/documents \
+  -H 'Content-Type: application/json' \
+  -d '{"title": "RFC 001", "body": "Proposal body."}'
+
+# Submit for review
+curl -s -X POST http://localhost:3000/documents/1/submit \
+  -H 'Content-Type: application/json' \
+  -d '{"reviewer": "alice"}'
+
+# Approve
+curl -s -X POST http://localhost:3000/documents/1/approve
+```
+
+<Tip>
+  The database is in-memory (`sqlite::memory:`). It resets each time the server restarts.
+</Tip>

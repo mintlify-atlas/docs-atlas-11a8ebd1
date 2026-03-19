@@ -1,0 +1,159 @@
+---
+title: "#[state]"
+description: "Define the legal lifecycle phases of your workflow."
+---
+
+`#[state]` is applied to an enum. Each variant becomes a marker type that the type system uses to track which phase a machine is currently in. The macro generates one marker type per variant, plus the trait bounds Statum uses for typed machines and transitions.
+
+## What it does
+
+`#[state]` transforms an enum declaration into a set of zero-sized marker types. Code that holds a `Machine<Draft>` cannot accidentally call methods that only exist on `Machine<Published>` — the compiler forbids it at the call site.
+
+<CardGroup cols={2}>
+  <Card title="Unit variants" icon="circle">
+    No payload. The state carries no extra data beyond its identity.
+  </Card>
+  <Card title="Data-bearing variants" icon="database">
+    A single-field tuple variant. The payload is available as `self.state_data` inside that state.
+  </Card>
+</CardGroup>
+
+## Rules
+
+- Must be applied to an `enum`.
+- Variants must be unit variants or single-field tuple variants.
+- Generics on the state enum are not supported.
+- Struct variants (`Draft { title: String }`) are not supported.
+
+<Warning>
+  Struct variants are not supported. Use a single-field tuple variant with a named struct instead:
+
+  ```rust
+  // This does not compile with #[state]
+  enum Bad {
+      Draft { title: String },
+  }
+
+  // Do this instead
+  struct DraftData { title: String }
+
+  #[state]
+  enum Good {
+      Draft(DraftData),
+  }
+  ```
+</Warning>
+
+## Unit variants
+
+The simplest form: each variant is a phase with no associated payload.
+
+```rust
+use statum::state;
+
+#[state]
+enum LightState {
+    Off,
+    On,
+}
+```
+
+This generates two marker types: `Off` and `On`. A `Machine<Off>` and a `Machine<On>` are different types.
+
+## Data-bearing variants
+
+Single-field tuple variants carry a payload that is only accessible when the machine is in that state.
+
+```rust
+use statum::state;
+
+#[state]
+enum ReviewState {
+    Draft,
+    InReview(Reviewer),
+    Published,
+}
+
+#[derive(Clone)]
+struct Reviewer {
+    name: String,
+}
+```
+
+Inside a transition or validator for the `InReview` state, `self.state_data` is of type `Reviewer`. In any other state, that field does not exist.
+
+## Using state data in a transition
+
+```rust
+use statum::{machine, state, transition};
+
+#[state]
+enum State {
+    Draft(MyDraft),
+    InReview,
+    Published,
+}
+
+struct MyDraft {
+    title: String,
+    content: String,
+}
+
+#[machine]
+struct Machine<State> {}
+
+#[transition]
+impl Machine<Draft> {
+    pub fn into_in_review(self) -> Machine<InReview> {
+        // state_data is available as the payload type for this state
+        let _draft: &MyDraft = &self.state_data;
+        self.transition()
+    }
+}
+```
+
+## What gets generated
+
+For each variant in the enum, `#[state]` generates one marker type. Given:
+
+```rust
+#[state]
+enum CheckoutState {
+    EmptyCart,
+    ReadyToPay(OrderDraft),
+    Paid,
+}
+```
+
+The macro produces:
+
+- A marker type `EmptyCart` implementing `UnitState`
+- A marker type `ReadyToPay` implementing `DataState` with `StateMarker::Data = OrderDraft`
+- A marker type `Paid` implementing `UnitState`
+
+The underlying traits from `statum-core`:
+
+```rust
+pub trait StateMarker {
+    type Data;
+}
+
+pub trait UnitState: StateMarker<Data = ()> {}
+pub trait DataState: StateMarker {}
+```
+
+## Placing derives
+
+If you need derives on your state enum, place them **below** `#[state]`:
+
+```rust
+#[state]
+#[derive(Debug, Clone)]
+enum TaskState {
+    Draft,
+    InReview(String),
+    Published,
+}
+```
+
+This ordering ensures `#[state]` runs before derive macros expand.

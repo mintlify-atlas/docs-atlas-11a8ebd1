@@ -1,0 +1,89 @@
+---
+title: "Installation"
+description: "Add Statum to your Rust project."
+---
+
+Statum targets stable Rust and requires **Rust 1.93 or later**. No nightly features are used.
+
+<Steps>
+  <Step title="Add the dependency">
+    Add `statum` to your `Cargo.toml`:
+
+    ```toml
+    [dependencies]
+    statum = "0.6.3"
+    ```
+  </Step>
+
+  <Step title="Import the macros">
+    Bring the three core macros into scope in any file where you define a state machine:
+
+    ```rust
+    use statum::{machine, state, transition};
+    ```
+
+    For typed rehydration from persisted data, also import `validators`:
+
+    ```rust
+    use statum::{machine, state, transition, validators};
+    ```
+  </Step>
+
+  <Step title="Build your project">
+    Run a standard build to confirm everything compiles:
+
+    ```bash
+    cargo build
+    ```
+  </Step>
+</Steps>
+
+## Workspace usage
+
+If your project is a Cargo workspace, add `statum` to the specific member crate that defines your state machines rather than the workspace root:
+
+```toml
+# my-crate/Cargo.toml
+[dependencies]
+statum = "0.6.3"
+```
+
+You can also declare a shared version in the workspace root and inherit it:
+
+```toml
+# Cargo.toml (workspace root)
+[workspace.dependencies]
+statum = "0.6.3"
+
+# my-crate/Cargo.toml
+[dependencies]
+statum = { workspace = true }
+```
+
+## MSRV
+
+The minimum supported Rust version (MSRV) is **1.93**. This is declared in `Cargo.toml` and enforced by CI.
+
+<Note>
+  Statum does not use any nightly features or unstable compiler flags. The `rust-toolchain.toml` in the repository pins stable.
+</Note>
+
+## Rust toolchain
+
+Statum is tested against stable Rust. Install or update to the latest stable toolchain with:
+
+```bash
+rustup update stable
+```
+
+To verify your installed version:
+
+```bash
+rustc --version
+```
+
+<Warning>
+  Versions of Rust older than 1.93 are not supported. If you see unexpected macro errors, check your toolchain version first.
+</Warning>
+
+Ready to write your first state machine? Continue to the [quickstart](/quickstart).

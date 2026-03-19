@@ -1,0 +1,144 @@
+---
+title: "Projection"
+description: "Helper utilities for projecting append-only event logs into typed machine states."
+---
+
+The `statum::projection` module provides helpers for folding append-only event streams into row-shaped projections before feeding them into `#[validators]` rebuilds.
+
+`#[validators]` works on one persisted shape at a time. If your storage model is append-only, use these helpers to reduce events first, then pass the result to `into_machine()` or `.into_machines()`.
+
+## `ProjectionReducer`
+
+```rust
+pub trait ProjectionReducer<Event> {
+    /// The output projection type.
+    type Projection;
+    /// The reducer-specific error type.
+    type Error;
+
+    /// Create the first projection value from the first event in a stream.
+    fn seed(&self, event: &Event) -> Result<Self::Projection, Self::Error>;
+
+    /// Apply a later event to an existing projection value.
+    fn apply(&self, projection: &mut Self::Projection, event: &Event) -> Result<(), Self::Error>;
+}
+```
+
+Implement `ProjectionReducer` to define how events are folded into a single projection value:
+
+- `seed` is called with the first event in a stream to create the initial projection.
+- `apply` is called for every subsequent event, mutating the projection in place.
+
+## `reduce_one`
+
+```rust
+pub fn reduce_one<Event, I, R>(
+    events: I,
+    reducer: &R,
+) -> Result<R::Projection, ProjectionError<R::Error>>
+where
+    I: IntoIterator<Item = Event>,
+    R: ProjectionReducer<Event>,
+```
+
+Folds one ordered event stream into one projection value. Returns `ProjectionError::EmptyInput` if the iterator yields no events.
+
+## `reduce_grouped`
+
+```rust
+pub fn reduce_grouped<Event, I, K, KF, R>(
+    events: I,
+    key_fn: KF,
+    reducer: &R,
+) -> Result<Vec<R::Projection>, ProjectionError<R::Error>>
+where
+    I: IntoIterator<Item = Event>,
+    KF: Fn(&Event) -> K,
+    K: Eq + Hash + Clone,
+    R: ProjectionReducer<Event>,
+```
+
+Reduces many ordered event streams into projection values grouped by key. Events are applied in encounter order for each key, and the output preserves the first-seen order of keys in the input stream.
+
+## `ProjectionError`
+
+```rust
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProjectionError<E> {
+    /// The reducer was asked to fold an empty stream.
+    EmptyInput,
+    /// The reducer rejected one of the events in the stream.
+    Reducer(E),
+}
+```
+
+| Variant | When returned |
+|---|---|
+| `EmptyInput` | The input iterator yielded no events. |
+| `Reducer(E)` | A `seed` or `apply` call returned an `Err`. |
+
+`ProjectionError<E>` implements `Display` when `E: Display` and `std::error::Error` when `E: std::error::Error + 'static`.
+
+## Complete example
+
+This example is from the `statum-core` projection module documentation:
+
+```rust
+use statum_core::projection::{reduce_grouped, ProjectionReducer};
+
+#[derive(Clone)]
+struct OrderEvent {
+    order_id: u64,
+    amount_cents: u64,
+}
+
+struct OrderTotals;
+
+impl ProjectionReducer<OrderEvent> for OrderTotals {
+    type Projection = (u64, u64);
+    type Error = core::convert::Infallible;
+
+    fn seed(&self, event: &OrderEvent) -> Result<Self::Projection, Self::Error> {
+        Ok((event.order_id, event.amount_cents))
+    }
+
+    fn apply(
+        &self,
+        projection: &mut Self::Projection,
+        event: &OrderEvent,
+    ) -> Result<(), Self::Error> {
+        projection.1 += event.amount_cents;
+        Ok(())
+    }
+}
+
+let projections = reduce_grouped(
+    vec![
+        OrderEvent {
+            order_id: 2,
+            amount_cents: 100,
+        },
+        OrderEvent {
+            order_id: 1,
+            amount_cents: 50,
+        },
+        OrderEvent {
+            order_id: 2,
+            amount_cents: 25,
+        },
+    ],
+    |event| event.order_id,
+    &OrderTotals,
+)?;
+
+assert_eq!(projections, vec![(2, 125), (1, 50)]);
+```
+
+<Note>
+  The output order mirrors the first-seen order of keys in the input, not insertion order by key value. In the example above, `order_id: 2` appears first in the input stream, so its projection appears first in the output.
+</Note>
+
+## Related
+
+- [`#[validators]`](/api/validators) — rebuilds typed machines from the row-shaped projection output.
+- [`Error`](/api/error) — Statum's runtime error type.

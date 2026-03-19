@@ -1,0 +1,243 @@
+---
+title: "Migrating to 0.6"
+description: "Breaking changes and migration steps for upgrading from 0.5.x to 0.6."
+---
+
+This guide covers the `0.6` breaking change for `0.5.x` users, followed by earlier `0.5` migration notes for older code. If you are starting fresh on `0.6`, you can skip this page and start with the [quickstart](/quickstart).
+
+## 0.6 breaking change
+
+<Warning>
+  `statum::bon` and `statum::bon::builder` have been removed. Any code that imports or depends on the re-exported `bon` crate will fail to compile.
+</Warning>
+
+### `statum::bon` is gone
+
+Before, Statum re-exported the `bon` crate. That re-export is removed in `0.6`.
+
+<CodeGroup>
+
+```rust before.rs
+use statum::bon;
+use statum::bon::builder as _;
+```
+
+```toml after (Cargo.toml)
+[dependencies]
+bon = "3"
+```
+
+</CodeGroup>
+
+If you were only using Statum's generated builders and never reaching into `bon` directly, you can simply remove the import.
+
+Statum `0.6` keeps the builder-first workflow surface but owns the builder implementation instead of re-exporting `bon`. The supported entry points are unchanged:
+
+- `Machine::<State>::builder()`
+- `row.into_machine()`
+- `rows.into_machines()`
+- `rows.into_machines_by(...)`
+
+### 0.6 migration checklist
+
+<Steps>
+  <Step title="Remove bon imports">
+    Remove any `use statum::bon` or `use statum::bon::builder` imports from your code.
+  </Step>
+  <Step title="Add bon directly if needed">
+    If your application depends on `bon` for its own purposes, add `bon = "3"` to your `Cargo.toml` and import it directly.
+  </Step>
+  <Step title="Verify builder call shapes">
+    Confirm you are calling `Machine::<State>::builder()`, `into_machine()`, `.into_machines()`, and `.into_machines_by(...)`. These call shapes are unchanged.
+  </Step>
+  <Step title="Treat generated builder internals as opaque">
+    Do not rely on generated builder type names or internal fields as stable public API.
+  </Step>
+</Steps>
+
+---
+
+## Earlier 0.5 migration
+
+If you are upgrading from a version earlier than `0.5`, work through the steps below after completing the `0.6` checklist above.
+
+### `#[transition]` is explicit
+
+<Warning>
+  Transition impl blocks that are missing the `#[transition]` attribute will no longer have access to `self.transition()`, `self.transition_with()`, and `self.transition_map()`.
+</Warning>
+
+<CodeGroup>
+
+```rust before.rs
+impl Machine<Draft> {
+    fn submit(self) -> Machine<InReview> {
+        self.transition()
+    }
+}
+```
+
+```rust after.rs
+#[transition]
+impl Machine<Draft> {
+    fn submit(self) -> Machine<InReview> {
+        self.transition()
+    }
+}
+```
+
+</CodeGroup>
+
+### `#[validators]` uses the machine name only
+
+<Warning>
+  The `state = ...` and `machine = ...` keyword arguments to `#[validators]` are removed. Pass only the machine name.
+</Warning>
+
+<CodeGroup>
+
+```rust before.rs
+#[validators(state = TaskState, machine = TaskMachine)]
+impl StoredTask {
+    fn is_draft(&self) -> Result<()> { /* ... */ }
+}
+```
+
+```rust after.rs
+#[validators(TaskMachine)]
+impl StoredTask {
+    fn is_draft(&self) -> statum::Result<()> { /* ... */ }
+}
+```
+
+</CodeGroup>
+
+Statum resolves the state family from the machine definition.
+
+### Validator expectations are stricter
+
+<Warning>
+  Validators that do not match the following rules will produce compile errors.
+</Warning>
+
+- You need one `is_{state}` method per state variant.
+- Validator methods must take exactly `&self`.
+- Unit states return `statum::Result<()>`.
+- Data-bearing states return `statum::Result<StateData>`.
+- If any validator is `async`, the generated builders become `async`.
+
+### Canonical rebuild names changed
+
+<Warning>
+  The following entry points are removed: `machine_builder()`, `machines_builder()`, and `TaskMachineSuperState`.
+</Warning>
+
+Use these names in `0.5` and later:
+
+| Old name | New name |
+|---|---|
+| `machine_builder()` | `into_machine()` |
+| `machines_builder()` | `.into_machines()` |
+| — | `.into_machines_by(\|row\| machine::Fields { ... })` |
+| `TaskMachineSuperState` | `machine::SomeState` |
+
+<Note>
+  `machine::State` is still available as a compatibility alias during migration.
+</Note>
+
+Cross-module batch rebuilds still require the machine-scoped trait import:
+
+```rust
+use task_machine::IntoMachinesExt as _;
+```
+
+### Legacy generated traits are gone
+
+<Warning>
+  Old generated helper traits such as `TaskMachineTransitionTo` and `StateVariant` are removed.
+</Warning>
+
+Replace them with:
+
+- Direct machine methods
+- `statum::StateMarker`
+- `statum::UnitState`
+- `statum::DataState`
+- `statum::CanTransitionTo<Next>`
+- `statum::CanTransitionWith<Data>`
+- `statum::CanTransitionMap<Next>`
+
+### State and machine definitions are checked more strictly
+
+**`#[state]`**
+
+- Must be an enum.
+- Must have at least one variant.
+- Variants must be unit or single-field tuple variants.
+- Struct variants and generics are rejected.
+
+**`#[machine]`**
+
+- Must be a struct.
+- The first generic parameter must match the `#[state]` enum name.
+- Matching derives on the `#[state]` enum and machine are required when needed.
+- `#[machine]` should sit above `#[derive(...)]`.
+
+### Construction is builder-first
+
+Use the generated per-state builders:
+
+```rust
+let draft = Machine::<Draft>::builder()
+    .field_a(...)
+    .build();
+
+let review = Machine::<InReview>::builder()
+    .field_a(...)
+    .state_data(ReviewData { ... })
+    .build();
+```
+
+The generated positional constructor still exists, but the builder is the intended path.
+
+### New additive helpers
+
+<Note>
+  The following features are new in `0.5` and available without any breaking changes.
+</Note>
+
+- `.into_machines_by(...)` for heterogeneous batch machine context.
+- `statum::projection::{ProjectionReducer, reduce_one, reduce_grouped}` for event-log projection before rehydration.
+- `transition_map(...)` for data-to-data transitions that consume the current state payload.
+
+### Examples moved
+
+- Old `statum/examples/*.rs` examples are removed.
+- Toy demos now live under `statum-examples/src/toy_demos/`.
+- Service-shaped and protocol-shaped showcases live under `statum-examples/src/showcases/`.
+
+### 0.5 migration checklist
+
+<Steps>
+  <Step title="Update #[state] enum">
+    Ensure the enum matches current variant rules: unit or single-field tuple variants only, no struct variants, no generics.
+  </Step>
+  <Step title="Update machine generic and derive placement">
+    Confirm the first generic parameter matches the `#[state]` enum name and `#[machine]` sits above `#[derive(...)]`.
+  </Step>
+  <Step title="Add #[transition] to impl blocks">
+    Annotate every transition impl block with `#[transition]`.
+  </Step>
+  <Step title="Rename validators and rehydration entrypoints">
+    Switch to `#[validators(MachineName)]`, `into_machine()`, `.into_machines()`, and `.into_machines_by(...)`.
+  </Step>
+  <Step title="Update match sites">
+    Update match arms to use `machine::SomeState` variants.
+  </Step>
+  <Step title="Move off removed legacy traits">
+    Replace any code using old generated helper traits with direct machine methods or the crate-level stable traits.
+  </Step>
+  <Step title="Run tests">
+    Run `cargo test -p statum-macros` and your workspace tests.
+  </Step>
+</Steps>

@@ -1,0 +1,216 @@
+---
+title: "SQLite event log rebuild"
+description: "Append-only event storage with projection-based typed rehydration."
+---
+
+This showcase models an order fulfillment workflow using an append-only event log. The database stores raw events — `created`, `paid`, `packed`, `shipped`, `delivered` — and never mutates them. To get the current typed state of an order, the showcase projects the event stream into a summary row and passes that row through `#[validators]`.
+
+This is the strongest argument for why Statum exists: you can reconstruct a fully typed machine from historical events without any mutable state table.
+
+## What it demonstrates
+
+- Append-only event storage: no `UPDATE` statements, only `INSERT`
+- `ProjectionReducer` folding a stream of events into a typed projection row
+- `reduce_one` for single-order reconstruction and `reduce_grouped` for batch reconstruction
+- `into_machines()` converting a `Vec<ProjectionRow>` into a `Vec<order_machine::SomeState>` in one call
+
+## State machine
+
+```rust
+#[state]
+pub enum OrderState {
+    Created(CreatedOrder),
+    Paid(PaidOrder),
+    Packed(PackedOrder),
+    Shipped(ShippedOrder),
+    Delivered(DeliveredOrder),
+}
+
+#[machine]
+pub struct OrderMachine<OrderState> {}
+```
+
+Every state carries data. The machine itself has no durable fields — all order context lives inside the state-data structs, accumulated through transitions:
+
+```rust
+#[transition]
+impl OrderMachine<Created> {
+    fn pay(self, payment_receipt: String) -> OrderMachine<Paid> {
+        self.transition_map(|created| PaidOrder {
+            order: created.order,
+            payment_receipt,
+        })
+    }
+}
+
+#[transition]
+impl OrderMachine<Paid> {
+    fn pack(self, pick_ticket: String) -> OrderMachine<Packed> {
+        self.transition_map(|paid| PackedOrder {
+            order: paid.order,
+            payment_receipt: paid.payment_receipt,
+            pick_ticket,
+        })
+    }
+}
+```
+
+`transition_map` carries forward the previous state's data into the next state's struct, keeping the full audit trail in the type.
+
+## The projection layer
+
+Raw `EventRow` values are folded into `OrderProjectionRow` using `ProjectionReducer`:
+
+```rust
+impl projection::ProjectionReducer<EventRow> for OrderProjector {
+    type Projection = OrderProjectionRow;
+    type Error = RebuildError;
+
+    fn seed(&self, event: &EventRow) -> Result<Self::Projection, Self::Error> {
+        if event.event_type != EVENT_CREATED {
+            return Err(RebuildError::CorruptEventLog(
+                "order event stream must start with a created event",
+            ));
+        }
+
+        Ok(OrderProjectionRow {
+            order_id: event.order_id,
+            customer: required_created_value(&event.customer)?,
+            sku: required_created_value(&event.sku)?,
+            status: EVENT_CREATED.to_string(),
+            payment_receipt: None,
+            pick_ticket: None,
+            tracking_number: None,
+        })
+    }
+
+    fn apply(
+        &self,
+        projection: &mut Self::Projection,
+        event: &EventRow,
+    ) -> Result<(), Self::Error> {
+        match event.event_type.as_str() {
+            EVENT_PAID => {
+                projection.status = EVENT_PAID.to_string();
+                projection.payment_receipt = Some(required_event_value(event)?);
+                Ok(())
+            }
+            EVENT_PACKED => {
+                projection.status = EVENT_PACKED.to_string();
+                projection.pick_ticket = Some(required_event_value(event)?);
+                Ok(())
+            }
+            // ...
+            _ => Err(RebuildError::CorruptEventLog(
+                "order event stream contained an unknown event type",
+            )),
+        }
+    }
+}
+```
+
+`seed` builds the initial projection from the first event. `apply` folds subsequent events in. The result is an `OrderProjectionRow` that `#[validators]` can then test.
+
+## Single-order vs batch reconstruction
+
+<Tabs>
+  <Tab title="Single order">
+    ```rust
+    pub async fn load_state(
+        &self,
+        order_id: i64,
+    ) -> Result<order_machine::SomeState, RebuildError> {
+        let events = self.events_for(order_id).await?;
+        let row = projection::reduce_one(events, &OrderProjector)
+            .map_err(|error| map_projection_error(error, Some(order_id)))?;
+        row.into_machine().build().map_err(|_| {
+            RebuildError::CorruptEventLog("projected order row did not match any validator")
+        })
+    }
+    ```
+  </Tab>
+  <Tab title="All orders">
+    ```rust
+    pub async fn load_all_states(&self) -> Result<Vec<order_machine::SomeState>, RebuildError> {
+        let rows = self.project_all_orders().await?;
+        rows.into_machines()
+            .build()
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                RebuildError::CorruptEventLog("projected order row did not match any validator")
+            })
+    }
+    ```
+
+    Batch projection uses `reduce_grouped`, which groups a flat event list by a key function before folding:
+
+    ```rust
+    async fn project_all_orders(&self) -> Result<Vec<OrderProjectionRow>, RebuildError> {
+        let events = sqlx::query_as::<_, EventRow>(
+            "SELECT * FROM order_events ORDER BY event_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        projection::reduce_grouped(events, |event| event.order_id, &OrderProjector)
+            .map_err(|error| map_projection_error(error, None))
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Validators
+
+`#[validators]` on `OrderProjectionRow` maps the projected summary to the correct typed machine state. The `is_packed` validator, for example, requires that `payment_receipt` and `pick_ticket` are both present, and that `tracking_number` is absent:
+
+```rust
+#[validators(OrderMachine)]
+impl OrderProjectionRow {
+    fn is_packed(&self) -> statum::Result<PackedOrder> {
+        if self.order_id <= 0
+            || self.customer.is_empty()
+            || self.sku.is_empty()
+            || self.status != EVENT_PACKED
+            || self.tracking_number.is_some()
+        {
+            return Err(statum::Error::InvalidState);
+        }
+
+        match (&self.payment_receipt, &self.pick_ticket) {
+            (Some(payment_receipt), Some(pick_ticket))
+                if !payment_receipt.trim().is_empty() && !pick_ticket.trim().is_empty() =>
+            {
+                Ok(PackedOrder {
+                    order: OrderContext {
+                        order_id: self.order_id,
+                        customer: self.customer.clone(),
+                        sku: self.sku.clone(),
+                    },
+                    payment_receipt: payment_receipt.clone(),
+                    pick_ticket: pick_ticket.clone(),
+                })
+            }
+            _ => Err(statum::Error::InvalidState),
+        }
+    }
+    // ...
+}
+```
+
+## How to run
+
+```bash
+cargo run -p statum-examples --bin sqlite-event-log-rebuild
+```
+
+The showcase creates two orders, drives them through different phases, then loads and prints all current states:
+
+```
+order=1 customer=acme sku=widget state=delivered ...
+order=2 customer=globex sku=gizmo state=packed ...
+```
+
+<Tip>
+  The database is in-memory. No files are created on disk.
+</Tip>

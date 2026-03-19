@@ -1,0 +1,156 @@
+---
+title: "#[state]"
+description: "Procedural macro that defines lifecycle phases for a typestate machine."
+---
+
+The `#[state]` macro is applied to an enum to declare the legal lifecycle phases of a machine. Each variant becomes a distinct marker type in the type system.
+
+## Usage
+
+```rust
+use statum::state;
+
+#[state]
+enum ReviewState {
+    Draft,
+    InReview(Reviewer),
+    Published,
+}
+
+#[derive(Clone)]
+struct Reviewer {
+    name: String,
+}
+```
+
+## Accepted forms
+
+`#[state]` accepts two forms of enum variants:
+
+| Form | Example | Description |
+|---|---|---|
+| Unit variant | `Draft` | No associated data. Generates a marker that implements `UnitState`. |
+| Single-field tuple variant | `InReview(Reviewer)` | Carries one associated data value. Generates a marker that implements `DataState`. |
+
+<Warning>
+  Struct variants and enums with generic parameters are rejected at compile time.
+</Warning>
+
+## What it generates
+
+For each variant, `#[state]` generates:
+
+- A marker type with the same name as the variant (e.g., `Draft`, `InReview`, `Published`).
+- An implementation of `StateMarker` for that marker type, with `Data = ()` for unit variants and `Data = ThePayloadType` for tuple variants.
+- An implementation of `UnitState` for unit variant markers.
+- An implementation of `DataState` for tuple variant markers.
+- The trait bounds Statum uses for typed machines and transitions.
+
+### Type signatures
+
+For a unit variant `Draft`:
+
+```rust
+// Generated
+struct Draft;
+
+impl StateMarker for Draft {
+    type Data = ();
+}
+
+impl UnitState for Draft {}
+```
+
+For a tuple variant `InReview(Reviewer)`:
+
+```rust
+// Generated
+struct InReview;
+
+impl StateMarker for InReview {
+    type Data = Reviewer;
+}
+
+impl DataState for InReview {}
+```
+
+## Restrictions
+
+- The annotated item must be an enum.
+- The enum must have at least one variant.
+- All variants must be unit variants or single-field tuple variants.
+- Struct variants are not allowed.
+- Generic parameters on the enum are not allowed.
+
+## Derives
+
+Place derives **below** `#[state]`:
+
+```rust
+#[state]
+#[derive(Debug, Clone)]
+enum TaskState {
+    Draft,
+    InReview(String),
+    Published,
+}
+```
+
+Placing derives above `#[state]` will interfere with macro expansion.
+
+## Complete example
+
+This example is the Checkout workflow from the Statum crate documentation:
+
+```rust
+use statum::{machine, state, transition};
+
+#[state]
+enum CheckoutState {
+    EmptyCart,
+    ReadyToPay(OrderDraft),
+    Paid,
+}
+
+#[derive(Clone)]
+struct OrderDraft {
+    total_cents: u64,
+}
+
+#[machine]
+struct Checkout<CheckoutState> {
+    id: String,
+}
+
+#[transition]
+impl Checkout<EmptyCart> {
+    fn review(self, total_cents: u64) -> Checkout<ReadyToPay> {
+        self.transition_with(OrderDraft { total_cents })
+    }
+}
+
+#[transition]
+impl Checkout<ReadyToPay> {
+    fn pay(self) -> Checkout<Paid> {
+        self.transition()
+    }
+}
+
+fn main() {
+    let cart = Checkout::<EmptyCart>::builder()
+        .id("order-1".to_owned())
+        .build();
+
+    let ready = cart.review(4200);
+    assert_eq!(ready.state_data.total_cents, 4200);
+
+    let _paid = ready.pay();
+}
+```
+
+## Related
+
+- [`#[machine]`](/api/machine) — defines the durable context that the machine carries across states.
+- [`StateMarker`](/api/traits/state-marker) — the trait implemented on every generated marker type.
+- [`UnitState`](/api/traits/state-marker#unitstate) — sub-trait for markers with no associated data.
+- [`DataState`](/api/traits/state-marker#datastate) — sub-trait for markers that carry a payload.

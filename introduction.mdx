@@ -1,0 +1,108 @@
+---
+title: "Introduction"
+description: "Make invalid states impossible to represent — at compile time."
+---
+
+# Statum
+
+Statum is a Rust typestate framework for making invalid, undesirable, or not-yet-validated states unrepresentable in ordinary code.
+
+It applies the same idea as `Option` and `Result` — making absence and failure explicit in the type system — to **workflow and protocol state**. If a state should not exist in your code, Statum prevents it from compiling.
+
+```rust
+use statum::{machine, state, transition};
+
+#[state]
+enum LightState {
+    Off,
+    On,
+}
+
+#[machine]
+struct LightSwitch<LightState> {
+    name: String,
+}
+
+#[transition]
+impl LightSwitch<Off> {
+    fn switch_on(self) -> LightSwitch<On> {
+        self.transition()
+    }
+}
+
+#[transition]
+impl LightSwitch<On> {
+    fn switch_off(self) -> LightSwitch<Off> {
+        self.transition()
+    }
+}
+
+fn main() {
+    let light = LightSwitch::<Off>::builder()
+        .name("desk lamp".to_owned())
+        .build();
+
+    let light = light.switch_on();
+    let _light = light.switch_off();
+    // light.switch_on() on an Off machine — this won't compile:
+    // light.switch_off(); // ← compile error: no method on LightSwitch<Off>
+}
+```
+
+## What the compiler enforces
+
+`LightSwitch<Off>` and `LightSwitch<On>` are **different types**. The compiler enforces this:
+
+- `switch_on()` only exists on `LightSwitch<Off>`
+- `switch_off()` only exists on `LightSwitch<On>`
+- State-specific data only exists when the machine is in that state
+- Attempting to call a method on the wrong state is a **compile error**, not a runtime panic
+
+## The four building blocks
+
+<CardGroup cols={2}>
+  <Card title="#[state]" icon="list" href="/concepts/state">
+    Define the legal lifecycle phases of your workflow as an enum. Each variant becomes a typed marker.
+  </Card>
+  <Card title="#[machine]" icon="server" href="/concepts/machine">
+    Define durable context that persists across all states. Fields are accessible throughout the workflow.
+  </Card>
+  <Card title="#[transition]" icon="arrow-right" href="/concepts/transition">
+    Declare legal edges between states. Transition methods consume `self` and return the next typed machine.
+  </Card>
+  <Card title="#[validators]" icon="shield-check" href="/concepts/validators">
+    Rebuild typed machines from persisted data. Stored rows must prove they represent a valid state before entering your core API.
+  </Card>
+</CardGroup>
+
+## When to use Statum
+
+Statum is a good fit when:
+
+- **Workflow order is stable and meaningful** — your protocol has a defined set of legal phases
+- **Invalid transitions are expensive** — the cost of a wrong state is high (data corruption, user-facing errors, billing mistakes)
+- **Available methods should change by phase** — different states have different operations
+- **Some data only belongs to specific states** — a reviewer name only makes sense during code review, not after publishing
+
+Statum is not a good fit when:
+
+- The workflow is highly ad hoc or user-authored
+- Most branching is runtime business logic with no stable structure
+- States are still changing faster than the API around them
+
+## Get started
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Add Statum to your Rust project. Targets stable Rust 1.93+.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build your first typestate machine in minutes.
+  </Card>
+  <Card title="Tutorial" icon="graduation-cap" href="/guides/tutorial-review-workflow">
+    Step-by-step guide building a review workflow from scratch.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/state">
+    Full reference for all macros, traits, and types.
+  </Card>
+</CardGroup>

@@ -1,0 +1,76 @@
+---
+title: "Showcases"
+description: "Real-world, app-shaped examples showing Statum in production-style scenarios."
+---
+
+Showcases are not toy demos. Each one is a working, app-shaped program that wires Statum into a realistic stack — HTTP, CLI, SQLite, async workers, or WebSocket protocols — and demonstrates a specific pattern that matters in production.
+
+Every showcase compiles and runs against the same workspace as the library. The source lives in `statum-examples/src/showcases/`.
+
+<CardGroup cols={2}>
+  <Card
+    title="Axum + SQLite review"
+    icon="globe"
+    href="/showcases/axum-sqlite-review"
+  >
+    HTTP review workflow with typed state rehydration from SQLite on each request.
+  </Card>
+  <Card
+    title="CLI deploy pipeline"
+    icon="terminal"
+    href="/showcases/clap-deploy-pipeline"
+  >
+    Repeated CLI invocations with SQLite-backed typed rehydration and explicit apply/failure/rollback phases.
+  </Card>
+  <Card
+    title="SQLite event log rebuild"
+    icon="database"
+    href="/showcases/sqlite-event-log"
+  >
+    Append-only event storage with projection-based typed rehydration and batch reconstruction.
+  </Card>
+  <Card
+    title="Tokio job runner"
+    icon="rotate-cw"
+    href="/showcases/tokio-job-runner"
+  >
+    Retries, leases, async side effects, and typed rehydration in a background worker loop.
+  </Card>
+  <Card
+    title="WebSocket session lifecycle"
+    icon="plug"
+    href="/showcases/websocket-session"
+  >
+    Protocol-safe frame handling with phase-gated behavior across a session lifecycle.
+  </Card>
+</CardGroup>
+
+## Running the showcases
+
+Each showcase is a standalone binary in the `statum-examples` crate. Run any of them with:
+
+```bash
+cargo run -p statum-examples --bin axum-sqlite-review
+cargo run -p statum-examples --bin clap-sqlite-deploy-pipeline
+cargo run -p statum-examples --bin sqlite-event-log-rebuild
+cargo run -p statum-examples --bin tokio-sqlite-job-runner
+cargo run -p statum-examples --bin tokio-websocket-session
+```
+
+<Note>
+  The `axum-sqlite-review` binary starts an HTTP server on `127.0.0.1:3000`. All other showcases run to completion and print their output, then exit.
+</Note>
+
+## What each showcase covers
+
+| Showcase | Persistence | Key pattern |
+|---|---|---|
+| Axum + SQLite review | SQLite (in-memory) | Per-request typed rehydration via `#[validators]` |
+| CLI deploy pipeline | SQLite (file-backed) | Multi-phase pipeline with branching outcomes |
+| SQLite event log rebuild | SQLite (in-memory) | Append-only events, projection, batch `into_machines()` |
+| Tokio job runner | SQLite (in-memory) | Lease-based locking, retry scheduling, async transitions |
+| WebSocket session | None | Protocol-safe frame dispatch, no persistence needed |
+
+## Where to start
+
+If you want one example explained in depth, start with the [guided review tutorial](/guides/tutorial-review-workflow). If you want the strongest argument for why Statum exists, start with the [SQLite event log rebuild](/showcases/sqlite-event-log).

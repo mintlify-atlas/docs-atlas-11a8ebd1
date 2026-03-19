@@ -1,0 +1,173 @@
+---
+title: "#[machine]"
+description: "Define durable context that persists across all states."
+---
+
+`#[machine]` is applied to a struct whose first generic parameter names the `#[state]` enum family. It generates a typed machine surface with a builder, a matching enum for persisted rebuilds, and helpers for batch reconstruction.
+
+## What it does
+
+The struct you write becomes the schema for durable machine context — fields that exist regardless of which state the machine is in. The macro generates:
+
+<CardGroup cols={2}>
+  <Card title="Typed Machine<State>" icon="box">
+    Each concrete state produces a distinct type. `Machine<Draft>` and `Machine<Published>` are different types with different available methods.
+  </Card>
+  <Card title="Builder" icon="wrench">
+    `Machine::<InitialState>::builder()` constructs a new machine with all fields set via method chaining.
+  </Card>
+  <Card title="SomeState enum" icon="list">
+    A machine-scoped `machine::SomeState` enum for matching machines rebuilt from persisted data.
+  </Card>
+  <Card title="Fields struct" icon="table">
+    A machine-scoped `machine::Fields` struct used by `.into_machines_by(...)` for heterogeneous batch rebuilds.
+  </Card>
+</CardGroup>
+
+## Rules
+
+- Must be applied to a `struct`.
+- The first generic parameter must match the `#[state]` enum name.
+- Put `#[machine]` **above** `#[derive(...)]`.
+
+<Warning>
+  If derives expand before `#[machine]`, you will see a `missing fields marker and state_data` error. Always put `#[machine]` above `#[derive(...)]`:
+
+  ```rust
+  // Wrong — derives run first
+  #[derive(Debug, Clone)]
+  #[machine]
+  struct Task<TaskState> { id: u64 }
+
+  // Correct
+  #[machine]
+  #[derive(Debug, Clone)]
+  struct Task<TaskState> { id: u64 }
+  ```
+</Warning>
+
+## Basic example
+
+```rust
+use statum::{machine, state};
+
+#[state]
+enum TaskState {
+    Draft,
+    Published,
+}
+
+#[machine]
+struct Task<TaskState> {
+    id: u64,
+}
+
+fn main() {
+    let task = Task::<Draft>::builder().id(1).build();
+    assert_eq!(task.id, 1);
+}
+```
+
+## Accessing fields vs state data
+
+The struct fields you declare are always available on the machine by name:
+
+```rust
+#[machine]
+struct LightSwitch<LightState> {
+    name: String,
+}
+
+let light = LightSwitch::<Off>::builder()
+    .name("desk lamp".to_owned())
+    .build();
+
+println!("{}", light.name); // always available
+```
+
+State-specific payload is accessed via `self.state_data`. It is only present on states declared with a tuple payload:
+
+```rust
+#[state]
+enum CheckoutState {
+    EmptyCart,
+    ReadyToPay(OrderDraft),
+    Paid,
+}
+
+#[machine]
+struct Checkout<CheckoutState> {
+    id: String,
+}
+
+// After transitioning to ReadyToPay:
+let ready: Checkout<ReadyToPay> = cart.review(4200);
+assert_eq!(ready.state_data.total_cents, 4200);
+```
+
+## Machine\<StateA\> and Machine\<StateB\> are different types
+
+This is the core guarantee Statum provides. Given the light switch example:
+
+```rust
+use statum::{machine, state, transition};
+
+#[state]
+enum LightState {
+    Off,
+    On,
+}
+
+#[machine]
+struct LightSwitch<LightState> {
+    name: String,
+}
+
+#[transition]
+impl LightSwitch<Off> {
+    fn switch_on(self) -> LightSwitch<On> {
+        self.transition()
+    }
+}
+
+#[transition]
+impl LightSwitch<On> {
+    fn switch_off(self) -> LightSwitch<Off> {
+        self.transition()
+    }
+}
+```
+
+`switch_on()` only exists on `LightSwitch<Off>`. Calling it on a `LightSwitch<On>` is a compile error. The compiler enforces the workflow graph.
+
+## The SomeState enum
+
+When rebuilding machines from persisted data, `#[machine]` generates a wrapper enum for matching:
+
+```rust
+match rebuilt_machine {
+    task::SomeState::Draft(machine) => { /* Machine<Draft> */ }
+    task::SomeState::InReview(machine) => { /* Machine<InReview> */ }
+    task::SomeState::Published(machine) => { /* Machine<Published> */ }
+}
+```
+
+`task::State` is kept as an alias so older code continues to compile.
+
+## The Fields struct
+
+For batch rebuilds where each row needs different machine context, `#[machine]` generates a `machine::Fields` struct:
+
+```rust
+use task_machine::IntoMachinesExt as _;
+
+let machines = rows
+    .into_machines_by(|row| task_machine::Fields {
+        client: row.client.clone(),
+        name: row.name.clone(),
+    })
+    .build()
+    .await;
+```
+
+See [`#[validators]`](/concepts/validators) for the full batch reconstruction API.

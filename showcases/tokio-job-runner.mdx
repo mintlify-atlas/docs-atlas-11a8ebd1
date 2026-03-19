@@ -1,0 +1,189 @@
+---
+title: "Tokio job runner"
+description: "Retries, leases, async side effects, and typed rehydration in a background worker."
+---
+
+This showcase is an async background job runner built with Tokio. Jobs are persisted to SQLite and processed by a worker loop that selects runnable rows, rehydrates them into typed machines, runs them, and persists the result. The state machine handles queuing, lease-based locking, retry scheduling, success, and terminal failure.
+
+## What it demonstrates
+
+- Typed rehydration before each job execution, not just at startup
+- Lease tokens stored as state-specific data on `Running`, preventing double-processing
+- Retry scheduling with `available_at_ms` enforced by the `Retrying` state's validator
+- Async transitions using `tokio::task::yield_now` to cooperatively yield during processing
+- Terminal failure when `attempts == max_attempts`
+
+## State machine
+
+```rust
+#[state]
+pub enum JobState {
+    Queued,
+    Running(JobLease),
+    Retrying(RetryPlan),
+    Succeeded(JobResult),
+    Failed(FailureInfo),
+}
+
+#[machine]
+pub struct JobMachine<JobState> {
+    pub id: i64,
+    pub job_type: String,
+    pub payload: String,
+    pub attempts: i64,
+    pub max_attempts: i64,
+}
+```
+
+The `Running` state carries a `JobLease` with a unique `lease_token`. The `Retrying` state carries a `RetryPlan` with `available_at_ms` and `last_error`. Neither field exists on any other state.
+
+## Transitions
+
+```rust
+#[transition]
+impl JobMachine<Queued> {
+    fn start(mut self, lease_token: String) -> JobMachine<Running> {
+        self.attempts += 1;
+        self.transition_with(JobLease { lease_token })
+    }
+}
+
+#[transition]
+impl JobMachine<Retrying> {
+    fn restart(mut self, lease_token: String) -> JobMachine<Running> {
+        self.attempts += 1;
+        self.transition_with(JobLease { lease_token })
+    }
+}
+
+#[transition]
+impl JobMachine<Running> {
+    fn succeed(self, output: String) -> JobMachine<Succeeded> {
+        self.transition_with(JobResult { output })
+    }
+
+    fn retry(self, available_at_ms: i64, error: String) -> JobMachine<Retrying> {
+        self.transition_with(RetryPlan { available_at_ms, last_error: error })
+    }
+
+    fn fail(self, error: String) -> JobMachine<Failed> {
+        self.transition_with(FailureInfo { error })
+    }
+}
+```
+
+Both `Queued` and `Retrying` can enter `Running`. The `Running` state branches to `Succeeded`, `Retrying`, or `Failed`.
+
+## The worker loop
+
+Each tick of the worker selects one runnable row (either `queued` or `retrying` with an elapsed delay), rehydrates it, transitions it to `Running`, persists the lease, processes the job, then persists the outcome:
+
+```rust
+pub async fn run_next(&mut self) -> Result<bool, RunnerError> {
+    let Some(row) = self.next_runnable_row().await? else {
+        return Ok(false);
+    };
+
+    let machine = self.rehydrate_row(row.clone())?;
+    let running = match machine {
+        job_machine::SomeState::Queued(machine) => machine.start(self.next_lease_token()),
+        job_machine::SomeState::Retrying(machine) => machine.restart(self.next_lease_token()),
+        _ => return Err(RunnerError::UnexpectedRunnableState),
+    };
+
+    self.persist_running(&running).await?;
+
+    match self.process_running_job(running).await {
+        ProcessedJob::Retrying(machine) => self.persist_retrying(&machine).await?,
+        ProcessedJob::Succeeded(machine) => self.persist_succeeded(&machine).await?,
+        ProcessedJob::Failed(machine) => self.persist_failed(&machine).await?,
+    }
+
+    Ok(true)
+}
+```
+
+The lease is written to the database before the job runs. If the process crashes mid-run, the row stays in `Running` with a stale lease token. A real deployment would add lease expiry logic to recover those rows.
+
+## Rehydration
+
+```rust
+fn rehydrate_row(&self, row: JobRow) -> Result<job_machine::SomeState, RunnerError> {
+    row.clone()
+        .into_machine()
+        .id(row.id)
+        .job_type(row.job_type)
+        .payload(row.payload)
+        .attempts(row.attempts)
+        .max_attempts(row.max_attempts)
+        .build()
+        .map_err(|_| RunnerError::CorruptState)
+}
+```
+
+## Validators
+
+The `is_retrying` validator checks that `attempts` is strictly less than `max_attempts` (there is still a retry budget), `available_at_ms` is positive, and `last_error` is present:
+
+```rust
+#[validators(JobMachine)]
+impl JobRow {
+    fn is_retrying(&self) -> statum::Result<RetryPlan> {
+        if *id <= 0
+            || job_type.is_empty()
+            || payload.is_empty()
+            || *attempts <= 0
+            || *attempts >= *max_attempts
+            || self.status != STATUS_RETRYING
+            || self.available_at_ms <= 0
+            || self.result_text.is_some()
+        {
+            return Err(statum::Error::InvalidState);
+        }
+
+        self.last_error
+            .clone()
+            .filter(|last_error| !last_error.trim().is_empty())
+            .map(|last_error| RetryPlan {
+                available_at_ms: self.available_at_ms,
+                last_error,
+            })
+            .ok_or(statum::Error::InvalidState)
+    }
+    // ...
+}
+```
+
+A row where `attempts >= max_attempts` cannot rehydrate as `Retrying`. It would only match `Failed`.
+
+## Runnable row selection
+
+The worker queries for jobs that are either `queued` or `retrying` with a delay that has elapsed:
+
+```sql
+SELECT ... FROM jobs
+WHERE status = 'queued'
+   OR (status = 'retrying' AND available_at_ms <= ?)
+ORDER BY available_at_ms, id
+LIMIT 1
+```
+
+## How to run
+
+```bash
+cargo run -p statum-examples --bin tokio-sqlite-job-runner
+```
+
+The showcase enqueues three jobs with different behaviors and runs them all to completion:
+
+- `email` with payload `ok` — succeeds on the first attempt
+- `thumbnail` with payload `flaky` — retries once, then succeeds
+- `invoice` with payload `always-fail` — exhausts its retry budget and fails
+
+Expected output:
+
+```
+job=1 type=email status=succeeded attempts=1/3 result=Some("email completed on attempt 1") error=None
+job=2 type=thumbnail status=succeeded attempts=2/3 result=Some("thumbnail recovered on attempt 2") error=None
+job=3 type=invoice status=failed attempts=2/2 result=None error=Some("invoice exhausted after 2 attempts")
+```

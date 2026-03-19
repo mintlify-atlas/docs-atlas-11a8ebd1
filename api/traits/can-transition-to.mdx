@@ -1,0 +1,72 @@
+---
+title: "CanTransitionTo"
+description: "Stable trait-level view of self.transition()."
+---
+
+`CanTransitionTo<Next>` is the stable, generic bound for machines that can move to a unit target state `Next`. It is the trait-level equivalent of calling `self.transition()` inside a `#[transition]` impl.
+
+## Trait definition
+
+```rust
+pub trait CanTransitionTo<Next> {
+    /// The transition result type.
+    type Output;
+
+    /// Perform the transition.
+    fn transition_to(self) -> Self::Output;
+}
+```
+
+## When it is implemented
+
+`#[transition]` impl blocks that contain a `self.transition()` call generate an implementation of `CanTransitionTo<Next>` on `Machine<CurrentState>`, where `Next` is the target state marker.
+
+## Usage
+
+Use `CanTransitionTo` as a bound in generic code that must accept any machine capable of transitioning to a particular state:
+
+```rust
+use statum::CanTransitionTo;
+
+fn advance<M>(machine: M) -> M::Output
+where
+    M: CanTransitionTo<Published>,
+{
+    machine.transition_to()
+}
+```
+
+## Example
+
+```rust
+use statum::{machine, state, transition};
+
+#[state]
+enum LightState {
+    Off,
+    On,
+}
+
+#[machine]
+struct Light<LightState> {}
+
+#[transition]
+impl Light<Off> {
+    fn switch_on(self) -> Light<On> {
+        self.transition()
+    }
+}
+
+fn main() {
+    let _light = Light::<Off>::builder().build().switch_on();
+}
+```
+
+The `#[transition]` macro generates `impl CanTransitionTo<On> for Light<Off>` as part of expanding the impl block above.
+
+## Related
+
+- [`#[transition]`](/api/transition) — the macro that generates `CanTransitionTo` implementations.
+- [`CanTransitionWith`](/api/traits/can-transition-with) — for transitions that supply data to the next state.
+- [`CanTransitionMap`](/api/traits/can-transition-map) — for transitions that derive next data from current data.
+- [`StateMarker`](/api/traits/state-marker) — base trait for all state marker types.

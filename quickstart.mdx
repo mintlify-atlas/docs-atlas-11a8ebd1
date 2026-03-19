@@ -1,80 +1,187 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Build your first typestate machine in under 5 minutes."
 ---
 
-## Get started in three steps
+This guide walks you through the `LightSwitch` example from the README, explains every piece, and then shows a second example with state-specific data.
 
-Get your documentation site running locally and make your first customization.
+## Build the LightSwitch machine
 
-### Step 1: Set up your local environment
+<Steps>
+  <Step title="Define the states">
+    Use `#[state]` on an enum to declare the legal lifecycle phases. Each variant becomes a distinct marker type:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```rust
+    use statum::{machine, state, transition};
 
-### Step 2: Deploy your changes
+    #[state]
+    enum LightState {
+        Off,
+        On,
+    }
+    ```
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    `LightState::Off` and `LightState::On` are now separate types in the type system — not values of the same enum at runtime.
+  </Step>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+  <Step title="Define the machine">
+    Use `#[machine]` on a struct to define the durable context that persists across all states. The first generic parameter must match the `#[state]` enum name:
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```rust
+    #[machine]
+    struct LightSwitch<LightState> {
+        name: String,
+    }
+    ```
 
-### Step 3: Go live
+    `LightSwitch<Off>` and `LightSwitch<On>` are **different types**. Fields like `name` are available in every state.
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    <Tip>
+      If you need derives such as `Debug` or `Clone`, place them **below** `#[machine]`:
+
+      ```rust
+      #[machine]
+      #[derive(Debug, Clone)]
+      struct LightSwitch<LightState> {
+          name: String,
+      }
+      ```
+
+      Placing derives above `#[machine]` causes a `missing fields marker and state_data` error.
+    </Tip>
+  </Step>
+
+  <Step title="Define the transitions">
+    Use `#[transition]` on `impl` blocks to declare the legal edges between states. Each transition method consumes `self` and returns the machine in its next state:
+
+    ```rust
+    #[transition]
+    impl LightSwitch<Off> {
+        fn switch_on(self) -> LightSwitch<On> {
+            self.transition()
+        }
+    }
+
+    #[transition]
+    impl LightSwitch<On> {
+        fn switch_off(self) -> LightSwitch<Off> {
+            self.transition()
+        }
+    }
+    ```
+
+    `switch_on()` only exists on `LightSwitch<Off>`. `switch_off()` only exists on `LightSwitch<On>`.
+  </Step>
+
+  <Step title="Construct and use the machine">
+    Build a new machine using the generated builder, then drive it through transitions:
+
+    ```rust
+    fn main() {
+        let light = LightSwitch::<Off>::builder()
+            .name("desk lamp".to_owned())
+            .build();
+
+        let light = light.switch_on();
+        let _light = light.switch_off();
+    }
+    ```
+
+    The builder requires you to supply every field declared on the machine struct. After `.build()`, the machine is in the state you specified as the generic parameter — here, `Off`.
+  </Step>
+</Steps>
+
+## What the compiler prevents
+
+Methods only exist on states where you define them. Calling a transition that doesn't exist for the current state is a **compile error**, not a runtime panic:
+
+```rust
+// This does not compile.
+let light = LightSwitch::<Off>::builder()
+    .name("desk lamp".to_owned())
+    .build();
+
+let _ = light.switch_off(); // error: no method `switch_off` on `LightSwitch<Off>`
+```
+
+The error appears at compile time, before your program ever runs. There is no guard code to write and no status field to check.
+
+## State-specific data with the Checkout example
+
+Some states carry data that is only meaningful in that phase. Use single-field tuple variants in your `#[state]` enum and `transition_with()` when moving into such a state.
+
+The following example is from `lib.rs`:
+
+```rust
+use statum::{machine, state, transition};
+
+#[state]
+enum CheckoutState {
+    EmptyCart,
+    ReadyToPay(OrderDraft),
+    Paid,
+}
+
+#[derive(Clone)]
+struct OrderDraft {
+    total_cents: u64,
+}
+
+#[machine]
+struct Checkout<CheckoutState> {
+    id: String,
+}
+
+#[transition]
+impl Checkout<EmptyCart> {
+    fn review(self, total_cents: u64) -> Checkout<ReadyToPay> {
+        self.transition_with(OrderDraft { total_cents })
+    }
+}
+
+#[transition]
+impl Checkout<ReadyToPay> {
+    fn pay(self) -> Checkout<Paid> {
+        self.transition()
+    }
+}
+
+fn main() {
+    let cart = Checkout::<EmptyCart>::builder()
+        .id("order-1".to_owned())
+        .build();
+
+    let ready = cart.review(4200);
+    assert_eq!(ready.state_data.total_cents, 4200);
+
+    let _paid = ready.pay();
+}
+```
+
+Key points:
+
+- `ReadyToPay(OrderDraft)` declares that this state carries an `OrderDraft` value.
+- `transition_with(OrderDraft { total_cents })` passes the data into the next state.
+- `ready.state_data.total_cents` accesses the state-specific data. The `state_data` field only exists on `Checkout<ReadyToPay>` — it is not present on `Checkout<EmptyCart>` or `Checkout<Paid>`.
+- `pay()` uses `self.transition()` because `Paid` is a unit state with no associated data.
+
+<Note>
+  `state_data` is typed to the data you associated with that state variant. The compiler knows its shape and will reject mismatched access at compile time.
+</Note>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="#[state]" icon="tag" href="/concepts/state">
+    Learn all the rules for defining lifecycle phases and what Statum generates from them.
+  </Card>
+  <Card title="#[machine]" icon="cpu" href="/concepts/machine">
+    Understand durable machine context, builders, and the generated enum for matching rebuilt machines.
+  </Card>
+  <Card title="#[transition]" icon="arrow-right" href="/concepts/transition">
+    Explore conditional transitions, data-carrying transitions, and transition helpers.
+  </Card>
+  <Card title="#[validators]" icon="database" href="/concepts/validators">
+    Rebuild typed machines from persisted rows, events, or database state.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

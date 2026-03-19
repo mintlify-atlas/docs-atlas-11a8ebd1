@@ -1,0 +1,87 @@
+---
+title: "CanTransitionWith"
+description: "Stable trait-level view of self.transition_with(data)."
+---
+
+`CanTransitionWith<Data>` is the stable, generic bound for machines that can move to a data-bearing state by supplying a payload value. It is the trait-level equivalent of calling `self.transition_with(data)` inside a `#[transition]` impl.
+
+## Trait definition
+
+```rust
+pub trait CanTransitionWith<Data> {
+    /// The next state selected by this transition.
+    type NextState;
+    /// The transition result type.
+    type Output;
+
+    /// Perform the transition with payload data.
+    fn transition_with_data(self, data: Data) -> Self::Output;
+}
+```
+
+## When it is implemented
+
+`#[transition]` impl blocks that contain a `self.transition_with(data)` call generate an implementation of `CanTransitionWith<Data>` on `Machine<CurrentState>`.
+
+## Usage
+
+Use `CanTransitionWith` as a bound in generic code that must accept any machine capable of transitioning with a particular data type:
+
+```rust
+use statum::CanTransitionWith;
+
+fn apply_draft<M>(machine: M, draft: OrderDraft) -> M::Output
+where
+    M: CanTransitionWith<OrderDraft>,
+{
+    machine.transition_with_data(draft)
+}
+```
+
+## Example
+
+```rust
+use statum::{machine, state, transition};
+
+#[state]
+enum CheckoutState {
+    EmptyCart,
+    ReadyToPay(OrderDraft),
+    Paid,
+}
+
+#[derive(Clone)]
+struct OrderDraft {
+    total_cents: u64,
+}
+
+#[machine]
+struct Checkout<CheckoutState> {
+    id: String,
+}
+
+#[transition]
+impl Checkout<EmptyCart> {
+    fn review(self, total_cents: u64) -> Checkout<ReadyToPay> {
+        self.transition_with(OrderDraft { total_cents })
+    }
+}
+
+fn main() {
+    let cart = Checkout::<EmptyCart>::builder()
+        .id("order-1".to_owned())
+        .build();
+
+    let ready = cart.review(4200);
+    assert_eq!(ready.state_data.total_cents, 4200);
+}
+```
+
+The `#[transition]` macro generates `impl CanTransitionWith<OrderDraft> for Checkout<EmptyCart>` as part of expanding the impl block above.
+
+## Related
+
+- [`#[transition]`](/api/transition) — the macro that generates `CanTransitionWith` implementations.
+- [`CanTransitionTo`](/api/traits/can-transition-to) — for transitions to unit target states.
+- [`CanTransitionMap`](/api/traits/can-transition-map) — for transitions that derive next data from current data.
+- [`StateMarker`](/api/traits/state-marker) — base trait for all state marker types.

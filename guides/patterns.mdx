@@ -1,0 +1,187 @@
+---
+title: "Patterns"
+description: "Common Statum patterns for real-world workflows."
+---
+
+This page collects the common Statum patterns that are useful after the quick start. Each pattern is in service of the same goal: legal states should be explicit, and undesirable states should not be smuggled through ordinary APIs.
+
+<AccordionGroup>
+
+  <Accordion title="Branching decisions">
+
+A transition method should still return one concrete next state. Put branching in a normal helper and dispatch into explicit transition methods so the branch result is still explicit in the type:
+
+```rust
+enum Decision {
+    Next(ProcessMachine<NextState>),
+    Other(ProcessMachine<OtherState>),
+}
+
+impl ProcessMachine<Init> {
+    fn decide(self, event: Event) -> Decision {
+        match event {
+            Event::Go => Decision::Next(self.to_next()),
+            Event::Alternative => Decision::Other(self.to_other()),
+        }
+    }
+}
+```
+
+  </Accordion>
+
+  <Accordion title="Guarded transitions">
+
+Keep preconditions in normal methods and transition only after the guard passes:
+
+```rust
+impl Machine<Pending> {
+    fn try_activate(self) -> statum::Result<Machine<Active>> {
+        if self.can_activate() {
+            Ok(self.activate())
+        } else {
+            Err(statum::Error::InvalidState)
+        }
+    }
+}
+```
+
+  </Accordion>
+
+  <Accordion title="State-specific data">
+
+Attach data only to states where it is actually valid. Transition into those states with `transition_with(data)`:
+
+```rust
+#[state]
+enum ReviewState {
+    Draft,
+    InReview(ReviewData),
+    Published,
+}
+
+#[transition]
+impl Document<Draft> {
+    fn submit_for_review(self, reviewer: String) -> Document<InReview> {
+        self.transition_with(ReviewData { reviewer })
+    }
+}
+```
+
+  </Accordion>
+
+  <Accordion title="Data-to-data edges">
+
+When the next state's payload should be derived by consuming the current state's payload, use `transition_map(...)` instead of cloning fields into a new value first:
+
+```rust
+#[transition]
+impl Order<Packed> {
+    fn ship(self, tracking: String) -> Order<Shipped> {
+        self.transition_map(|packed| ShippedData {
+            order_id: packed.order_id,
+            tracking,
+        })
+    }
+}
+```
+
+  </Accordion>
+
+  <Accordion title="Async side effects">
+
+Keep side effects in async methods and call a synchronous transition at the end:
+
+```rust
+#[transition]
+impl Job<Queued> {
+    fn start(self) -> Job<Running> {
+        self.transition()
+    }
+}
+
+impl Job<Queued> {
+    async fn start_with_effects(self) -> Job<Running> {
+        do_io().await;
+        self.start()
+    }
+}
+```
+
+  </Accordion>
+
+  <Accordion title="Nested machines">
+
+Use a machine as state data when a parent workflow owns a child workflow:
+
+```rust
+#[state]
+enum ParentState {
+    NotStarted,
+    InProgress(SubMachine<Running>),
+    Done,
+}
+```
+
+  </Accordion>
+
+  <Accordion title="Rollbacks and snapshots">
+
+If you need undo or history, carry the prior state's data into the next state or add an explicit rollback transition:
+
+```rust
+#[transition]
+impl Machine<Draft> {
+    fn publish(self) -> Machine<Published> {
+        let previous = self.state_data.clone();
+        self.transition_with(PublishData { previous })
+    }
+}
+```
+
+  </Accordion>
+
+  <Accordion title="Batch rehydration with per-item machine context">
+
+Use `.into_machines_by(...)` when each persisted row needs different machine fields during rebuild:
+
+```rust
+let machines = rows
+    .into_machines_by(|row| workflow_machine::Fields {
+        tenant: row.tenant.clone(),
+        workflow_name: row.workflow_name.clone(),
+    })
+    .build();
+```
+
+  </Accordion>
+
+  <Accordion title="Event logs and projection rows">
+
+For append-only storage, project events into validator rows first and then rehydrate typed machines:
+
+```rust
+use statum::projection::{ProjectionReducer, reduce_grouped};
+
+let rows = reduce_grouped(events, |event| event.order_id, &OrderProjector)?;
+let machines = rows.into_machines().build();
+```
+
+  </Accordion>
+
+  <Accordion title="Protocol sessions">
+
+Not every Statum workflow is persistence-driven. Session and protocol lifecycles work well when legal frame order matters and method availability should change by phase.
+
+This pattern is useful for WebSocket sessions, RPC protocol handshakes, or any interaction where the server must enforce a specific exchange sequence at compile time rather than runtime.
+
+  </Accordion>
+
+  <Accordion title="When to stop">
+
+Statum works best when the stable core of a protocol is known up front.
+
+If most of your logic is runtime branching, user-authored graphs, or rapidly changing states, keep that part in normal runtime validation and use typestate only around the small stable core.
+
+  </Accordion>
+
+</AccordionGroup>

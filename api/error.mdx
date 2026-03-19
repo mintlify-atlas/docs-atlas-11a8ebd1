@@ -1,0 +1,85 @@
+---
+title: "Error and Result"
+description: "Runtime error types returned by Statum APIs."
+---
+
+Statum's runtime surface is minimal. Most of its guarantees are enforced at compile time. The `Error` enum and `Result` alias exist for the cases where validation must happen at runtime — primarily when rebuilding machines from persisted data.
+
+## `statum::Error`
+
+```rust
+#[derive(Debug)]
+pub enum Error {
+    /// Returned when a runtime check determines the current state is invalid.
+    InvalidState,
+}
+```
+
+`Error` has one variant:
+
+<ResponseField name="InvalidState" type="variant">
+  Returned when a validator method determines the persisted data does not match the expected state, or when no state validator succeeds during a machine rebuild.
+</ResponseField>
+
+## `statum::Result<T>`
+
+```rust
+pub type Result<T> = core::result::Result<T, Error>;
+```
+
+`statum::Result<T>` is a convenience alias for `core::result::Result<T, statum::Error>`. Use it as the return type for validator methods and in code that calls Statum rebuild APIs.
+
+```rust
+fn is_draft(&self) -> statum::Result<()> {
+    if self.status == "draft" {
+        Ok(())
+    } else {
+        Err(statum::Error::InvalidState)
+    }
+}
+```
+
+## `From<Error>` impl
+
+```rust
+impl<T> From<Error> for core::result::Result<T, Error> {
+    fn from(val: Error) -> Self {
+        Err(val)
+    }
+}
+```
+
+This allows an `Error` value to be converted directly into a `Result<T, Error>` using `.into()` or `?` in contexts that expect `Result<T, Error>`.
+
+## `Display` impl
+
+```rust
+impl core::fmt::Display for Error {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::result::Result<(), core::fmt::Error> {
+        write!(fmt, "{self:?}")
+    }
+}
+```
+
+`Error` formats using its `Debug` representation. `InvalidState` displays as `"InvalidState"`.
+
+## `std::error::Error` impl
+
+```rust
+impl std::error::Error for Error {}
+```
+
+`Error` implements `std::error::Error`, making it compatible with the standard error trait and error handling libraries.
+
+## When `InvalidState` is returned
+
+`InvalidState` is returned in the following situations:
+
+- A validator method determines the row does not match the expected state and returns `Err(Error::InvalidState)`.
+- No validator method succeeds when calling `into_machine().build()`.
+- Code manually returns `Err(Error::InvalidState)` from custom validation logic.
+
+## Related
+
+- [`#[validators]`](/api/validators) — where `statum::Result` and `Error::InvalidState` are most commonly used.
+- [`Projection`](/api/projection) — event-log reduction helpers with their own `ProjectionError` type.

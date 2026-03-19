@@ -1,0 +1,184 @@
+---
+title: "#[machine]"
+description: "Procedural macro that creates a typed state machine struct."
+---
+
+The `#[machine]` macro is applied to a struct to define the durable context that persists across all states of a typestate machine.
+
+## Usage
+
+```rust
+use statum::{machine, state};
+
+#[state]
+enum TaskState {
+    Draft,
+    Published,
+}
+
+#[machine]
+struct Task<TaskState> {
+    id: u64,
+}
+
+fn main() {
+    let task = Task::<Draft>::builder().id(1).build();
+    assert_eq!(task.id, 1);
+}
+```
+
+## Requirements
+
+- The annotated item must be a struct.
+- The first generic parameter must match the name of a `#[state]` enum (e.g., `Task<TaskState>`).
+- `#[machine]` must be placed above `#[derive(...)]`.
+
+<Warning>
+  Placing `#[derive(...)]` above `#[machine]` causes a `missing fields marker and state_data` compile error.
+</Warning>
+
+## Derives
+
+Place derives **below** `#[machine]`:
+
+```rust
+#[machine]
+#[derive(Debug, Clone)]
+struct Task<TaskState> {
+    id: u64,
+}
+```
+
+## What it generates
+
+### Typed surface
+
+`Machine<State>` becomes a real generic type. Each combination of machine and state is a distinct type:
+
+- `Task<Draft>` and `Task<Published>` are different types.
+- Fields declared on the struct (e.g., `id`) are accessible in every state.
+- For data-bearing states, a `state_data` field is available that is typed to the state's associated data.
+
+### Builder
+
+For each state, a builder is generated:
+
+```rust
+let task = Task::<Draft>::builder()
+    .id(1)
+    .build();
+```
+
+For data-bearing states, the builder also accepts `state_data`:
+
+```rust
+let review = Task::<InReview>::builder()
+    .id(2)
+    .state_data("alice".to_owned())
+    .build();
+```
+
+### `SomeState` enum
+
+A `machine::SomeState` enum is generated for matching rebuilt machines. Each variant wraps the fully-typed machine in that state:
+
+```rust
+match rebuilt {
+    task::SomeState::Draft(machine) => { /* machine: Task<Draft> */ }
+    task::SomeState::InReview(machine) => { /* machine: Task<InReview> */ }
+    task::SomeState::Published(machine) => { /* machine: Task<Published> */ }
+}
+```
+
+### `State` alias
+
+`machine::State` is available as a compatibility alias for `machine::SomeState` during migration.
+
+### `Fields` struct
+
+A `machine::Fields` struct is generated for heterogeneous batch rebuilds with `.into_machines_by(...)`:
+
+```rust
+rows.into_machines_by(|row| task::Fields { id: row.id })
+```
+
+### `IntoMachinesExt` trait
+
+A machine-scoped `IntoMachinesExt` trait is generated for cross-module batch rebuilds. Import it when calling `.into_machines()` or `.into_machines_by(...)` from outside the machine's module:
+
+```rust
+use task::IntoMachinesExt as _;
+```
+
+## Complete example
+
+```rust
+use statum::{machine, state, validators, Error};
+
+#[state]
+enum TaskState {
+    Draft,
+    InReview(String),
+    Published,
+}
+
+#[machine]
+struct Task<TaskState> {
+    id: u64,
+}
+
+struct TaskRow {
+    id: u64,
+    status: &'static str,
+    reviewer: Option<String>,
+}
+
+#[validators(Task)]
+impl TaskRow {
+    fn is_draft(&self) -> statum::Result<()> {
+        if self.status == "draft" {
+            Ok(())
+        } else {
+            Err(Error::InvalidState)
+        }
+    }
+
+    fn is_in_review(&self) -> statum::Result<String> {
+        if self.status == "in_review" {
+            self.reviewer.clone().ok_or(Error::InvalidState)
+        } else {
+            Err(Error::InvalidState)
+        }
+    }
+
+    fn is_published(&self) -> statum::Result<()> {
+        if self.status == "published" {
+            Ok(())
+        } else {
+            Err(Error::InvalidState)
+        }
+    }
+}
+
+fn main() -> statum::Result<()> {
+    let row = TaskRow {
+        id: 7,
+        status: "in_review",
+        reviewer: Some("alice".to_owned()),
+    };
+
+    let row_id = row.id;
+    let machine = row.into_machine().id(row_id).build()?;
+    match machine {
+        task::SomeState::InReview(task) => assert_eq!(task.state_data, "alice"),
+        _ => panic!("expected in-review task"),
+    }
+    Ok(())
+}
+```
+
+## Related
+
+- [`#[state]`](/api/state) — defines the legal lifecycle phases.
+- [`#[transition]`](/api/transition) — defines the legal edges between states.
+- [`#[validators]`](/api/validators) — rebuilds typed machines from persisted data.

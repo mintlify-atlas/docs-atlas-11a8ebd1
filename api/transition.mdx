@@ -1,0 +1,164 @@
+---
+title: "#[transition]"
+description: "Procedural macro that validates and enables state transition impl blocks."
+---
+
+The `#[transition]` macro is applied to `impl Machine<State>` blocks to declare the legal edges between states and unlock the transition helpers inside.
+
+## Usage
+
+```rust
+use statum::{machine, state, transition};
+
+#[state]
+enum LightState {
+    Off,
+    On,
+}
+
+#[machine]
+struct Light<LightState> {}
+
+#[transition]
+impl Light<Off> {
+    fn switch_on(self) -> Light<On> {
+        self.transition()
+    }
+}
+
+fn main() {
+    let _light = Light::<Off>::builder().build().switch_on();
+}
+```
+
+## Rules
+
+- `#[transition]` must annotate an `impl Machine<State>` block.
+- Transition methods must take `self` or `mut self` — they consume the current machine.
+- Return types may be `Machine<NextState>`, `Result<Machine<NextState>, E>`, or `Option<Machine<NextState>>`.
+
+## Transition helpers
+
+Inside a `#[transition]` impl block, three helpers are available:
+
+### `self.transition()`
+
+Moves the machine to a unit target state with no associated data.
+
+```rust
+#[transition]
+impl Light<Off> {
+    fn switch_on(self) -> Light<On> {
+        self.transition()
+    }
+}
+```
+
+The target state is inferred from the method return type. Use this when the next state is a unit variant.
+
+### `self.transition_with(data)`
+
+Moves the machine to a data-bearing target state, supplying the state payload.
+
+```rust
+#[transition]
+impl Checkout<EmptyCart> {
+    fn review(self, total_cents: u64) -> Checkout<ReadyToPay> {
+        self.transition_with(OrderDraft { total_cents })
+    }
+}
+```
+
+The data type must match the associated `Data` type declared for the target state variant.
+
+### `self.transition_map(|current| next_data)`
+
+Moves the machine to a data-bearing target state by consuming the current state's data and producing the next payload from it.
+
+```rust
+#[transition]
+impl Order<Pending> {
+    fn apply_discount(self) -> Order<Discounted> {
+        self.transition_map(|pending_data| DiscountedData {
+            original_cents: pending_data.total_cents,
+            discounted_cents: pending_data.total_cents / 2,
+        })
+    }
+}
+```
+
+Use `transition_map` when the next payload is derived from the current state's payload.
+
+## Wrapping in `Result` or `Option`
+
+Transition methods may return `Result<Machine<NextState>, E>` or `Option<Machine<NextState>>` to express fallible or conditional transitions:
+
+```rust
+#[transition]
+impl Invoice<Draft> {
+    fn submit(self) -> Result<Invoice<Submitted>, ValidationError> {
+        if self.amount_cents == 0 {
+            return Err(ValidationError::ZeroAmount);
+        }
+        Ok(self.transition())
+    }
+}
+```
+
+## Complete example
+
+The full Checkout workflow demonstrates all three transition helpers:
+
+```rust
+use statum::{machine, state, transition};
+
+#[state]
+enum CheckoutState {
+    EmptyCart,
+    ReadyToPay(OrderDraft),
+    Paid,
+}
+
+#[derive(Clone)]
+struct OrderDraft {
+    total_cents: u64,
+}
+
+#[machine]
+struct Checkout<CheckoutState> {
+    id: String,
+}
+
+#[transition]
+impl Checkout<EmptyCart> {
+    fn review(self, total_cents: u64) -> Checkout<ReadyToPay> {
+        self.transition_with(OrderDraft { total_cents })
+    }
+}
+
+#[transition]
+impl Checkout<ReadyToPay> {
+    fn pay(self) -> Checkout<Paid> {
+        self.transition()
+    }
+}
+
+fn main() {
+    let cart = Checkout::<EmptyCart>::builder()
+        .id("order-1".to_owned())
+        .build();
+
+    let ready = cart.review(4200);
+    assert_eq!(ready.state_data.total_cents, 4200);
+
+    let _paid = ready.pay();
+}
+```
+
+## Related
+
+- [`CanTransitionTo`](/api/traits/can-transition-to) — stable trait-level view of `self.transition()`.
+- [`CanTransitionWith`](/api/traits/can-transition-with) — stable trait-level view of `self.transition_with(data)`.
+- [`CanTransitionMap`](/api/traits/can-transition-map) — stable trait-level view of `self.transition_map(...)`.
+- [`#[state]`](/api/state) — defines the legal lifecycle phases.
+- [`#[machine]`](/api/machine) — defines the durable machine context.

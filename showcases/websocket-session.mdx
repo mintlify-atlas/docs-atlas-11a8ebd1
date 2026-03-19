@@ -1,0 +1,190 @@
+---
+title: "WebSocket session lifecycle"
+description: "Protocol-safe frame handling with phase-gated behavior."
+---
+
+This showcase models a WebSocket session using a typed state machine. Unlike the other showcases, there is no database. The machine lives in memory for the duration of the session and enforces protocol ordering: a client must authenticate before subscribing, and must subscribe before publishing. Illegal frame sequences return protocol errors rather than crashes or panics.
+
+## What it demonstrates
+
+- State-gated method availability: `publish` only exists on `SessionMachine<Subscribed>`
+- Protocol error responses for out-of-order frames, without crashing the session
+- Clean session teardown: `Close` is legal from any live state
+- Async channel-based session dispatch using Tokio `mpsc`
+
+## States and legal transitions
+
+```rust
+#[state]
+pub enum SessionState {
+    Connected,
+    Authenticated(SessionInfo),
+    Subscribed(Subscription),
+    Closed(CloseReason),
+}
+```
+
+| From | Frame | To | Notes |
+|---|---|---|---|
+| `Connected` | `Authenticate` | `Authenticated` | Token must parse as `token:<user>` |
+| `Connected` | `Close` | `Closed` | Immediate teardown |
+| `Authenticated` | `Subscribe` | `Subscribed` | Topic must be non-empty |
+| `Authenticated` | `Close` | `Closed` | Immediate teardown |
+| `Subscribed` | `Publish` | `Subscribed` | State unchanged; only legal in `Subscribed` |
+| `Subscribed` | `Close` | `Closed` | Immediate teardown |
+
+## Transitions
+
+```rust
+#[transition]
+impl SessionMachine<Connected> {
+    fn authenticate(self, user_id: String) -> SessionMachine<Authenticated> {
+        self.transition_with(SessionInfo { user_id })
+    }
+
+    fn close(self, reason: String) -> SessionMachine<Closed> {
+        self.transition_with(CloseReason { reason })
+    }
+}
+
+#[transition]
+impl SessionMachine<Authenticated> {
+    fn subscribe(self, topic: String) -> SessionMachine<Subscribed> {
+        let user_id = self.state_data.user_id.clone();
+        self.transition_with(Subscription { user_id, topic })
+    }
+
+    fn close(self, reason: String) -> SessionMachine<Closed> {
+        self.transition_with(CloseReason { reason })
+    }
+}
+
+#[transition]
+impl SessionMachine<Subscribed> {
+    fn close(self, reason: String) -> SessionMachine<Closed> {
+        self.transition_with(CloseReason { reason })
+    }
+}
+```
+
+`publish` is not a transition — it does not consume `self`. It is a regular method on `SessionMachine<Subscribed>` that validates the topic and returns a `ServerFrame`:
+
+```rust
+impl SessionMachine<Subscribed> {
+    fn publish(&self, topic: &str, body: &str) -> Result<ServerFrame, &'static str> {
+        validate_topic(topic)?;
+        validate_body(body)?;
+
+        if topic != self.state_data.topic {
+            return Err("publish topic does not match subscription");
+        }
+
+        Ok(ServerFrame::Delivered {
+            user_id: self.state_data.user_id.clone(),
+            topic: topic.to_string(),
+            body: body.to_string(),
+        })
+    }
+}
+```
+
+Because `publish` is only defined on `SessionMachine<Subscribed>`, calling it at compile time on any other state is a type error. There is no runtime check needed.
+
+## Frame types
+
+```rust
+pub enum ClientFrame {
+    Authenticate { token: String },
+    Subscribe { topic: String },
+    Publish { topic: String, body: String },
+    Close { reason: String },
+}
+
+pub enum ServerFrame {
+    Hello { connection_id: u64, peer_label: String },
+    Authenticated { user_id: String },
+    Subscribed { topic: String },
+    Delivered { user_id: String, topic: String, body: String },
+    Error { message: String },
+    Bye { reason: String },
+}
+```
+
+## Session dispatch loop
+
+The session runs in a spawned Tokio task. Its loop matches on the current `SomeState` variant and dispatches frames:
+
+```rust
+loop {
+    state = match state {
+        session_machine::SomeState::Connected(machine) => {
+            match recv_client(&mut client_rx).await? {
+                ClientFrame::Authenticate { token } => match parse_user_id(&token) {
+                    Ok(user_id) => {
+                        let next = machine.authenticate(user_id.clone());
+                        send_server(&server_tx, ServerFrame::Authenticated { user_id }).await?;
+                        session_machine::SomeState::Authenticated(next)
+                    }
+                    Err(message) => {
+                        send_server(&server_tx, error_frame(message)).await?;
+                        session_machine::SomeState::Connected(machine)
+                    }
+                },
+                ClientFrame::Subscribe { .. } => {
+                    send_server(&server_tx, error_frame("authenticate before subscribing")).await?;
+                    session_machine::SomeState::Connected(machine)
+                }
+                ClientFrame::Publish { .. } => {
+                    send_server(&server_tx, error_frame("authenticate before publishing")).await?;
+                    session_machine::SomeState::Connected(machine)
+                }
+                ClientFrame::Close { reason } => {
+                    let _closed = machine.close(reason.clone());
+                    send_server(&server_tx, ServerFrame::Bye { reason }).await?;
+                    return Ok(());
+                }
+            }
+        }
+        // Authenticated and Subscribed arms follow the same pattern
+        session_machine::SomeState::Closed(_) => return Ok(()),
+    };
+}
+```
+
+Out-of-order frames (e.g., `Publish` before `Authenticate`) return a `ServerFrame::Error`. The session stays in its current state. The connection is not dropped.
+
+## Spawning a session
+
+```rust
+pub fn spawn_session(connection_id: u64, peer_label: impl Into<String>) -> SessionHandle {
+    let (client_tx, client_rx) = mpsc::channel(8);
+    let (server_tx, server_rx) = mpsc::channel(8);
+
+    let task = tokio::spawn(run_session(
+        connection_id,
+        peer_label.into(),
+        client_rx,
+        server_tx,
+    ));
+
+    SessionHandle { client: client_tx, server: server_rx, task }
+}
+```
+
+`SessionHandle` exposes `send`, `recv`, and `finish` for driving the session from a test or from the `run()` demo.
+
+## How to run
+
+```bash
+cargo run -p statum-examples --bin tokio-websocket-session
+```
+
+The demo authenticates as `alice`, subscribes to `deployments`, publishes a message, then closes:
+
+```
+Hello { connection_id: 7, peer_label: "127.0.0.1:4000" }
+Authenticated { user_id: "alice" }
+Subscribed { topic: "deployments" }
+Delivered { user_id: "alice", topic: "deployments", body: "rollout started" }
+Bye { reason: "demo complete" }
+```

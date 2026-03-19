@@ -1,0 +1,253 @@
+---
+title: "Persistence and validators"
+description: "Turn persisted rows back into typed machine states using #[validators]."
+---
+
+`#[validators]` is Statum's typed rehydration feature. Use it when you need to turn a row, document, event payload, or other persisted representation back into a typed machine.
+
+This is the boundary where raw persisted facts either become one legal typed state or stay invalid runtime data. That is how Statum keeps not-yet-validated states out of ordinary code.
+
+## Mental model
+
+You define:
+
+- A `#[state]` enum that names the legal phases.
+- A `#[machine]` struct that carries durable context.
+- A persisted type, such as `DbRow` or `StoredTask`.
+- One validator method per state variant on that persisted type.
+
+Statum generates:
+
+- `into_machine()` for rebuilding one machine.
+- A machine-scoped enum like `task_machine::SomeState`. `task_machine::State` remains an alias for compatibility.
+- A machine-scoped `task_machine::Fields` struct for heterogeneous batch reconstruction.
+- A machine-scoped batch trait like `task_machine::IntoMachinesExt`.
+
+The important part is what Statum does not generate: it does not treat stored data as already trustworthy. Validators decide whether the persisted value actually represents `Draft`, `InReview`, `Published`, or nothing legal at all.
+
+## Pick the right entry point
+
+| Scenario | Entry point |
+|---|---|
+| One persisted value | `into_machine()` |
+| Collection, same machine fields for all | `.into_machines()` |
+| Collection, each item has different machine fields | `.into_machines_by(\|row\| machine::Fields { ... })` |
+
+## Reconstruction
+
+<Tabs>
+  <Tab title="Single item">
+
+```rust
+use statum::{machine, state, validators};
+
+#[state]
+enum TaskState {
+    Draft,
+    InReview(ReviewData),
+    Published,
+}
+
+struct ReviewData {
+    reviewer: String,
+}
+
+#[machine]
+struct TaskMachine<TaskState> {
+    client: String,
+    name: String,
+}
+
+enum Status {
+    Draft,
+    InReview,
+    Published,
+}
+
+struct DbRow {
+    status: Status,
+}
+
+#[validators(TaskMachine)]
+impl DbRow {
+    fn is_draft(&self) -> statum::Result<()> {
+        if matches!(self.status, Status::Draft) {
+            Ok(())
+        } else {
+            Err(statum::Error::InvalidState)
+        }
+    }
+
+    fn is_in_review(&self) -> statum::Result<ReviewData> {
+        if matches!(self.status, Status::InReview) {
+            Ok(ReviewData {
+                reviewer: format!("reviewer-for-{client}"),
+            })
+        } else {
+            Err(statum::Error::InvalidState)
+        }
+    }
+
+    fn is_published(&self) -> statum::Result<()> {
+        if matches!(self.status, Status::Published) {
+            Ok(())
+        } else {
+            Err(statum::Error::InvalidState)
+        }
+    }
+}
+
+fn rebuild(row: &DbRow) -> statum::Result<task_machine::SomeState> {
+    row.into_machine()
+        .client("acme".to_owned())
+        .name("spec".to_owned())
+        .build()
+}
+```
+
+The returned value is a wrapper enum, so you match once and then work with the concrete typed machine:
+
+```rust
+let row = DbRow {
+    status: Status::InReview,
+};
+
+match rebuild(&row)? {
+    task_machine::SomeState::Draft(machine) => {}
+    task_machine::SomeState::InReview(machine) => {
+        assert_eq!(machine.state_data.reviewer.as_str(), "reviewer-for-acme");
+    }
+    task_machine::SomeState::Published(machine) => {}
+}
+```
+
+After that match, you are no longer carrying "a row plus a status field." You are carrying one explicit legal state.
+
+  </Tab>
+  <Tab title="Batch — shared fields">
+
+When every item in a collection shares the same machine fields, use `.into_machines()` directly:
+
+```rust
+let machines = rows
+    .into_machines()
+    .client("acme".to_owned())
+    .build()
+    .await;
+```
+
+From other modules, import the machine-scoped batch trait first:
+
+```rust
+use task_machine::IntoMachinesExt as _;
+
+let machines = rows
+    .into_machines()
+    .client("acme".to_owned())
+    .build()
+    .await;
+```
+
+  </Tab>
+  <Tab title="Batch — per-item fields">
+
+If each row carries its own machine context, use `.into_machines_by(...)` and return the generated `machine::Fields` struct:
+
+```rust
+use task_machine::IntoMachinesExt as _;
+
+let machines = rows
+    .into_machines_by(|row| task_machine::Fields {
+        client: row.client.clone(),
+        name: row.name.clone(),
+    })
+    .build()
+    .await;
+```
+
+This returns a collection of per-item results, which lets you decide whether to fail fast, collect only valid machines, or report partial errors.
+
+Batch rebuilds preserve per-item failure information instead of forcing one all-or-nothing result shape.
+
+  </Tab>
+</Tabs>
+
+## What is available inside validator methods
+
+Validator methods always receive `&self` for the persisted type.
+
+Statum also makes machine fields available by name inside the validator body through generated bindings. If your machine has:
+
+```rust
+#[machine]
+struct TaskMachine<TaskState> {
+    client: String,
+    name: String,
+}
+```
+
+then `client` and `name` are available inside `is_draft`, `is_in_review`, and `is_published`.
+
+That is how typed rehydration can fetch extra data or use shared context without manual parameter threading. Persisted-row fields are not rebound: keep reading them from `self.status`, `self.id`, and so on.
+
+<AccordionGroup>
+  <Accordion title="Return types">
+
+Validator return types depend on whether the target state carries data:
+
+| State variant | Return type |
+|---|---|
+| Unit state (e.g. `Draft`) | `statum::Result<()>` |
+| Data-bearing state (e.g. `InReview(ReviewData)`) | `statum::Result<ReviewData>` |
+
+If every validator returns `Err(statum::Error::InvalidState)`, reconstruction fails with `InvalidState`.
+
+  </Accordion>
+  <Accordion title="Async validators">
+
+If any validator is `async`, the generated builder becomes `async` too:
+
+```rust
+let machine = row
+    .into_machine()
+    .client("acme".to_owned())
+    .build()
+    .await?;
+```
+
+This is useful when typed rehydration requires a network call or a database fetch.
+
+<Note>
+Keep the validator style consistent within a type so call sites are predictable. Mixing sync and async validators in the same `#[validators]` impl will make the generated builder async.
+</Note>
+
+  </Accordion>
+</AccordionGroup>
+
+## Event logs: project first, rehydrate second
+
+`#[validators]` works on one persisted shape at a time. For append-only event logs, project the stream into a row-like snapshot first, then rebuild typed machines from that projection.
+
+Statum ships small projection helpers for that layer:
+
+```rust
+use statum::projection::{ProjectionReducer, reduce_grouped};
+
+let projections = reduce_grouped(events, |event| event.order_id, &OrderProjector)?;
+let machines = projections
+    .into_machines()
+    .build();
+```
+
+`ProjectionReducer` gives you a typed fold, `reduce_one(...)` handles a single stream, and `reduce_grouped(...)` handles interleaved streams keyed by something like `order_id` while preserving first-seen key order.
+
+## Failure model
+
+- A validator that matches returns `Ok(...)` and selects that state.
+- A validator that does not match should return `Err(statum::Error::InvalidState)`.
+- Reconstruction fails when no validator matches.
+- Batch reconstruction returns one result per item, so callers can decide whether to stop on the first invalid row or collect partial successes.
+
+<Note>
+Keep validators narrowly focused on state membership. Put cross-cutting orchestration around the rebuild call, not inside every validator.
+</Note>
