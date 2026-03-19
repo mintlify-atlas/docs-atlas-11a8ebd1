@@ -139,7 +139,11 @@ For many orders in one pass:
 
 ```rust
 let projections = reduce_grouped(events, |event| event.order_id, &OrderProjector)?;
-let machines = projections.into_machines().build();
+let results = projections.into_machines().build();
+let machines: Vec<order_machine::SomeState> = results
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap_or_default();
 ```
 
 After that, downstream code works on typed states rather than repeating snapshot-to-workflow interpretation logic. That is the handoff from unvalidated facts to legal domain states.

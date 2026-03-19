@@ -157,13 +157,18 @@ let machines = rows
 
   <Accordion title="Event logs and projection rows">
 
-For append-only storage, project events into validator rows first and then rehydrate typed machines:
+For append-only storage, project events into validator rows first and then rehydrate typed machines.
+`.into_machines().build()` returns one result per row, not a single `Result`:
 
 ```rust
 use statum::projection::{ProjectionReducer, reduce_grouped};
 
 let rows = reduce_grouped(events, |event| event.order_id, &OrderProjector)?;
-let machines = rows.into_machines().build();
+let results = rows.into_machines().build();
+let machines: Vec<order_machine::SomeState> = results
+    .into_iter()
+    .filter_map(Result::ok)
+    .collect();
 ```
 
   </Accordion>

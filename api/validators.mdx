@@ -122,27 +122,36 @@ let machine = row.into_machine().id(row.id).build()?;
 
 ### `.into_machines()`
 
-Rebuilds a collection of rows when all items share the same machine fields. Requires the `IntoMachinesExt` trait to be in scope for cross-module use:
+Rebuilds a collection of rows when all items share the same machine fields. `.build()` returns an iterator of per-item `statum::Result<machine::SomeState>`. Requires the `IntoMachinesExt` trait to be in scope for cross-module use:
 
 ```rust
 use task::IntoMachinesExt as _;
 
-let machines = rows.into_machines().id(shared_id).build()?;
+let results = rows.into_machines().id(shared_id).build();
+// results is Vec<statum::Result<task::SomeState>> (or an iterator of Results)
+let machines: Vec<task::SomeState> = results
+    .into_iter()
+    .filter_map(Result::ok)
+    .collect();
 ```
 
 ### `.into_machines_by(|row| machine::Fields { ... })`
 
-Rebuilds a collection of rows when each item needs different machine field values:
+Rebuilds a collection of rows when each item needs different machine field values. Like `.into_machines()`, each item produces its own `statum::Result`:
 
 ```rust
 use task::IntoMachinesExt as _;
 
-let machines = rows.into_machines_by(|row| task::Fields { id: row.id }).build()?;
+let results = rows.into_machines_by(|row| task::Fields { id: row.id }).build();
+let machines: Vec<task::SomeState> = results
+    .into_iter()
+    .filter_map(Result::ok)
+    .collect();
 ```
 
 ## Matching rebuilt output
 
-The result of `.build()?` is a `machine::SomeState` enum. Match on its variants to access the typed machine:
+For single-item rebuilds, `.build()?` returns a `machine::SomeState` enum. Match on its variants to access the typed machine:
 
 ```rust
 match machine {

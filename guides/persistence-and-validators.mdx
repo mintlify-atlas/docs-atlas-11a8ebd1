@@ -126,10 +126,27 @@ After that match, you are no longer carrying "a row plus a status field." You ar
   </Tab>
   <Tab title="Batch — shared fields">
 
-When every item in a collection shares the same machine fields, use `.into_machines()` directly:
+When every item in a collection shares the same machine fields, use `.into_machines()` directly.
+`.build()` returns an iterator of per-item `statum::Result<machine::SomeState>` — one result per row.
 
 ```rust
-let machines = rows
+// sync validators
+let results = rows
+    .into_machines()
+    .client("acme".to_owned())
+    .build();
+
+let machines: Vec<task_machine::SomeState> = results
+    .into_iter()
+    .filter_map(Result::ok)
+    .collect();
+```
+
+If any validator is `async`, add `.await` after `.build()`:
+
+```rust
+// async validators
+let results = rows
     .into_machines()
     .client("acme".to_owned())
     .build()
@@ -140,34 +157,31 @@ From other modules, import the machine-scoped batch trait first:
 
 ```rust
 use task_machine::IntoMachinesExt as _;
-
-let machines = rows
-    .into_machines()
-    .client("acme".to_owned())
-    .build()
-    .await;
 ```
 
   </Tab>
   <Tab title="Batch — per-item fields">
 
-If each row carries its own machine context, use `.into_machines_by(...)` and return the generated `machine::Fields` struct:
+If each row carries its own machine context, use `.into_machines_by(...)` and return the generated `machine::Fields` struct.
+Like `.into_machines()`, this returns one `statum::Result` per item:
 
 ```rust
 use task_machine::IntoMachinesExt as _;
 
-let machines = rows
+let results = rows
     .into_machines_by(|row| task_machine::Fields {
         client: row.client.clone(),
         name: row.name.clone(),
     })
-    .build()
-    .await;
+    .build();
+
+let machines: Vec<task_machine::SomeState> = results
+    .into_iter()
+    .filter_map(Result::ok)
+    .collect();
 ```
 
-This returns a collection of per-item results, which lets you decide whether to fail fast, collect only valid machines, or report partial errors.
-
-Batch rebuilds preserve per-item failure information instead of forcing one all-or-nothing result shape.
+Batch rebuilds preserve per-item failure information instead of forcing one all-or-nothing result shape. You can fail fast, collect only valid machines, or report partial errors per row.
 
   </Tab>
 </Tabs>
@@ -234,9 +248,11 @@ Statum ships small projection helpers for that layer:
 use statum::projection::{ProjectionReducer, reduce_grouped};
 
 let projections = reduce_grouped(events, |event| event.order_id, &OrderProjector)?;
-let machines = projections
-    .into_machines()
-    .build();
+let results = projections.into_machines().build();
+let machines: Vec<order_machine::SomeState> = results
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap_or_default();
 ```
 
 `ProjectionReducer` gives you a typed fold, `reduce_one(...)` handles a single stream, and `reduce_grouped(...)` handles interleaved streams keyed by something like `order_id` while preserving first-seen key order.
