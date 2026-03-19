@@ -1,0 +1,124 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Statum",
+  "projectDescription": "A Rust typestate framework that makes invalid, undesirable, or not-yet-validated states impossible to represent at compile time.",
+  "theme": "palm",
+  "primaryColor": "#d4a03c",
+  "lightColor": "#7c542c",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/state",
+              "concepts/machine",
+              "concepts/transition",
+              "concepts/validators"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/tutorial-review-workflow",
+              "guides/persistence-and-validators",
+              "guides/event-log-rebuild",
+              "guides/patterns",
+              "guides/typestate-design-playbook"
+            ]
+          },
+          {
+            "group": "Showcases",
+            "pages": [
+              "showcases/overview",
+              "showcases/axum-sqlite-review",
+              "showcases/clap-deploy-pipeline",
+              "showcases/sqlite-event-log",
+              "showcases/tokio-job-runner",
+              "showcases/websocket-session"
+            ]
+          },
+          {
+            "group": "Migration",
+            "pages": [
+              "migration/to-0-6"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Macros",
+            "pages": [
+              "api/state",
+              "api/machine",
+              "api/transition",
+              "api/validators"
+            ]
+          },
+          {
+            "group": "Traits",
+            "pages": [
+              "api/traits/state-marker",
+              "api/traits/can-transition-to",
+              "api/traits/can-transition-with",
+              "api/traits/can-transition-map"
+            ]
+          },
+          {
+            "group": "Projection",
+            "pages": [
+              "api/projection"
+            ]
+          },
+          {
+            "group": "Error Handling",
+            "pages": [
+              "api/error"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Compile-time typestate enforcement via proc-macro attributes",
+    "State-specific data that only exists in the states where it is valid",
+    "Typed rehydration from persisted rows back into legal machine states",
+    "Builder-first API with zero runtime overhead for state transitions",
+    "Async validator support for database-backed state reconstruction",
+    "Batch rehydration with per-item or shared machine context",
+    "Event-log projection helpers for append-only storage patterns",
+    "Nested machine composition for hierarchical workflows"
+  ],
+  "publicApiSurface": [
+    "#[state] — defines lifecycle phases as an enum of typed state markers",
+    "#[machine] — defines a struct carrying durable context across all states",
+    "#[transition] — annotates impl blocks that define legal state transitions",
+    "#[validators(Machine)] — annotates impl blocks for typed rehydration from persisted data",
+    "StateMarker — trait implemented by all generated state marker types",
+    "UnitState — trait for unit (payload-free) state markers",
+    "DataState — trait for data-bearing state markers",
+    "CanTransitionTo<Next> — stable trait for self.transition()",
+    "CanTransitionWith<Data> — stable trait for self.transition_with(data)",
+    "CanTransitionMap<Next> — stable trait for self.transition_map(|data| ...)",
+    "statum::Error::InvalidState — returned when no validator matches during rehydration",
+    "statum::Result<T> — convenience alias for Result<T, statum::Error>",
+    "projection::ProjectionReducer — trait for folding event streams into row snapshots",
+    "projection::reduce_one — reduces a single event stream into a projection row",
+    "projection::reduce_grouped — reduces interleaved event streams keyed by entity id"
+  ]
+}
